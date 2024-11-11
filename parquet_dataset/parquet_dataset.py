@@ -83,7 +83,7 @@ class ParquetDataset(Dataset):
         return self.total_num_rows
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        total_idx = self._calculate_index_from_cumulative_counts(idx, self.cum_total_counts_np)
+        total_idx = self.calculate_index_from_cumulative_counts(idx, self.cum_total_counts_np)
         group: RowGroupOffset = self.cum_total_counts[total_idx]
         return torch.tensor(
             self._get_single_row_with_row_group_batching(
@@ -129,7 +129,7 @@ class ParquetDataset(Dataset):
 
         return self.pq_cache.df.row(row_idx)
 
-    def _calculate_index_from_cumulative_counts(self, idx: int, counts: np.ndarray) -> int:
+    def calculate_index_from_cumulative_counts(self, idx: int, counts: np.ndarray) -> int:
         """Find the index of the nearest value in `counts` that is <= idx. Assumes that
         `counts` is monotonically increasing."""
         return np.searchsorted(a=counts, v=idx, side="right") - 1

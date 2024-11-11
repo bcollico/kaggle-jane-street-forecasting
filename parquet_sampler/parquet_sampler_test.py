@@ -2,8 +2,6 @@
 
 import unittest
 
-import numpy as np
-
 from parquet_sampler.parquet_sampler import ParquetBatchedSampler
 from parquet_dataset.parquet_dataset import ParquetDataset
 
@@ -43,6 +41,32 @@ class TestParquetSampler(unittest.TestCase):
 
         # postcondition: sample_set should be empty
         self.assertEqual(sample_set, set())
+
+    def test_should_sample_in_batch_order(self):
+        """Check that we fully sample all indices expected."""
+        # precondition: create a set of all indices to be sampled
+        sample_list: list[int] = []
+
+        # under test: Append the order in which row groups are sampled from.
+        for sample in self.pq_sampler:
+            # Get the rowgroup/file total index.
+            idx = self.mock_dataset.pq_dataset.calculate_index_from_cumulative_counts(
+                sample.item(), self.mock_dataset.pq_dataset.cum_total_counts_np
+            )
+
+            # Add new rowgroup/file indices to the list if it's different than the latest.
+            if not sample_list or idx != sample_list[-1]:
+                sample_list.append(idx)
+
+        # postcondition: The unique list of row group orderings should be equivalent to the
+        # set of all row groups.
+        sample_set: set[int] = set(sample_list)
+        self.assertEqual(sample_set, set(range(len(self.mock_dataset.pq_dataset.cum_total_counts))))
+
+        # postcondition: The unique list of row group orderings should be the same size as the
+        # non-unique ordered set of row groups. We should be sampling row groups in order,
+        # so we should only ever add it to sample_list once.
+        self.assertEqual(len(sample_set), len(sample_list))
 
 
 if __name__ == "__main__":
