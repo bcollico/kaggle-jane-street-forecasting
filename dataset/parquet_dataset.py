@@ -17,7 +17,7 @@ def _get_cumulative_counts(raw_counts: List[int]) -> np.ndarray:
 
     List is returned as a numpy array to support np.searchsorted.
     """
-    return np.ndarray([sum(raw_counts[:i]) for i in range(len(raw_counts))])
+    return np.array([sum(raw_counts[:i]) for i in range(len(raw_counts))])
 
 
 @dataclass
@@ -69,7 +69,7 @@ class ParquetDataset(Dataset):
         # Get the cumulative number of rows before the start of each file and each row group
         # within a file.
         self.cum_row_counts: np.ndarray = _get_cumulative_counts(self.file_row_counts)
-        self.cum_row_group_counts: np.ndarray = [
+        self.cum_row_group_counts: List[np.ndarray] = [
             _get_cumulative_counts(c) for c in self.file_row_group_counts
         ]
 
@@ -118,7 +118,9 @@ class ParquetDataset(Dataset):
         cached file and row group, get the row directly from the cached
         DataFrame, otherwise, load a new row group into cache and then read.
         """
-        if file_idx != self.pq_cache.file_idx or row_group_idx != self.pq_cache.row_group_idx:
+        if not self.pq_cache or (
+            file_idx != self.pq_cache.file_idx or row_group_idx != self.pq_cache.row_group_idx
+        ):
             self.load_pq_file(file_idx=file_idx, row_group_idx=row_group_idx)
 
         return self.pq_cache.df.row(row_idx)
@@ -131,7 +133,7 @@ class ParquetDataset(Dataset):
     def load_pq_file(self, file_idx: int, row_group_idx: Optional[int] = None) -> None:
         """Load the Parquet file and specified row group as a Polars DataFrame."""
 
-        if file_idx == self.pq_cache.file_idx and row_group_idx == self.pq_cache.row_group_idx:
+        if self.pq_cache and file_idx == self.pq_cache.file_idx and row_group_idx == self.pq_cache.row_group_idx:
             # Early return if requesting the cached row group/file.
             return
 
