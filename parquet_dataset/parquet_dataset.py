@@ -66,6 +66,35 @@ class ParquetDataset(Dataset):
 
         self.total_num_rows: int = sum(self.file_row_counts)
 
+        self._setup_cumulative_counts()
+
+        # Member variable for caching a row group.
+        self.pq_cache: Optional[RowGroupCache] = None
+
+        if logging:
+            # Print the files that were loaded and the total number of samples
+            print("Loaded files with rows:")
+            for i, file in enumerate(file_paths):
+                print(f"\t{self.file_row_counts[i]} : {file}")
+
+            print(f"{len(self)} total samples.")
+
+    def __len__(self) -> int:
+        return self.total_num_rows
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        total_idx = self._calculate_index_from_cumulative_counts(idx, self.cum_total_counts_np)
+        group: RowGroupOffset = self.cum_total_counts[total_idx]
+        return torch.tensor(
+            self._get_single_row_with_row_group_batching(
+                file_idx=group.file_idx,
+                row_group_idx=group.row_group_idx,
+                row_idx=idx - group.offset,
+            )
+        )
+
+    def _setup_cumulative_counts(self) -> None:
+        """Setup the cumulative count arrays using the raw file and row group counts."""
         # Get the cumulative number of rows before the start of each file and each row group
         # within a file.
         self.cum_row_counts: np.ndarray = _get_cumulative_counts(self.file_row_counts)
@@ -85,32 +114,7 @@ class ParquetDataset(Dataset):
         # Also store just the offsets in a np array for faster lookup later.
         self.cum_total_counts_np = np.array([v.offset for v in self.cum_total_counts])
 
-        # Member variable for caching a row group.
-        self.pq_cache: Optional[RowGroupCache] = None
-
-        if logging:
-            # Print the files that were loaded and the total number of samples
-            print("Loaded files with rows:")
-            for i, file in enumerate(file_paths):
-                print(f"\t{self.file_row_counts[i]} : {file}")
-
-            print(f"{len(self)} total samples.")
-
-    def __len__(self) -> int:
-        return self.total_num_rows
-
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        total_idx = self.calculate_index_from_cumulative_counts(idx, self.cum_total_counts_np)
-        group: RowGroupOffset = self.cum_total_counts[total_idx]
-        return torch.tensor(
-            self.get_single_row_with_row_group_batching(
-                file_idx=group.file_idx,
-                row_group_idx=group.row_group_idx,
-                row_idx=idx - group.offset,
-            )
-        )
-
-    def get_single_row_with_row_group_batching(
+    def _get_single_row_with_row_group_batching(
         self, row_idx: int, file_idx: int, row_group_idx: int
     ) -> pl.DataFrame:
         """Get a single row from the parquet file, utilizing row_group cachine
@@ -121,19 +125,23 @@ class ParquetDataset(Dataset):
         if not self.pq_cache or (
             file_idx != self.pq_cache.file_idx or row_group_idx != self.pq_cache.row_group_idx
         ):
-            self.load_pq_file(file_idx=file_idx, row_group_idx=row_group_idx)
+            self._load_pq_file(file_idx=file_idx, row_group_idx=row_group_idx)
 
         return self.pq_cache.df.row(row_idx)
 
-    def calculate_index_from_cumulative_counts(self, idx: int, counts: np.ndarray) -> int:
+    def _calculate_index_from_cumulative_counts(self, idx: int, counts: np.ndarray) -> int:
         """Find the index of the nearest value in `counts` that is <= idx. Assumes that
         `counts` is monotonically increasing."""
         return np.searchsorted(a=counts, v=idx, side="right") - 1
 
-    def load_pq_file(self, file_idx: int, row_group_idx: Optional[int] = None) -> None:
+    def _load_pq_file(self, file_idx: int, row_group_idx: Optional[int] = None) -> None:
         """Load the Parquet file and specified row group as a Polars DataFrame."""
 
-        if self.pq_cache and file_idx == self.pq_cache.file_idx and row_group_idx == self.pq_cache.row_group_idx:
+        if (
+            self.pq_cache
+            and file_idx == self.pq_cache.file_idx
+            and row_group_idx == self.pq_cache.row_group_idx
+        ):
             # Early return if requesting the cached row group/file.
             return
 
