@@ -175,7 +175,6 @@ class DateTimeSegment:
     start_idx: int
     end_idx: int
 
-
 class DatetimeParquetDataset(ParquetDataset):
     """Parquet dataset where each sample is a unique date+time with multiple rows (corresponding to
     multiple symbols). The samples will also include features+lags for the time_context_window
