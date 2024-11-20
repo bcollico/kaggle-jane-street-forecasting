@@ -66,7 +66,7 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
         # memory context.
         self.memory_weight = torch.nn.Parameter(data=torch.Tensor([1.0]), requires_grad=True)
 
-    def calculate_attention_output(
+    def scaled_dot_product_attention(
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
     ) -> torch.Tensor:
         """Apply Equation 6 from https://arxiv.org/pdf/2404.07143 to calculate the `A_dot`
@@ -79,7 +79,7 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
             value (torch.Tensor): attention value matrix of shape (n_b, n_seq, d_head * n_head).
 
         Returns:
-            (torch.Tensor): Attention output of shape (n_b, n_seq, n_query, n_head, d_head).
+            (torch.Tensor): Attention output of shape (n_b, n_seq, n_query *n_head, d_head).
         """
         n_b, n_seq = query.shape[:2]
 
@@ -105,7 +105,12 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
         attention_probabilities = torch.nn.functional.softmax(attention_scores, dim=-1)
 
         # (n_b, n_query, n_head, n_seq, d_head) -> (n_b, n_seq, n_query, n_head, d_head)
-        return (attention_probabilities @ value_t).transpose(2, 3).transpose(1, 2)
+        return (
+            (attention_probabilities @ value_t)
+            .transpose(2, 3)
+            .transpose(1, 2)
+            .view(n_b, n_seq, self.n_query * self.n_head, self.d_head)
+        )
 
     def calculate_memory_attention(self, query: torch.Tensor) -> torch.Tensor:
         """Computes Equation 7 from https://arxiv.org/pdf/2404.07143 to get the memory component
@@ -116,7 +121,7 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
                 d_model = n_query * n_head * d_head
         Returns:
             (torch.Tensor): Memory contribution to the attention, shape
-            (n_b, n_seq, n_query, self.n_head * self.d_head)
+                (n_b, n_seq, n_query * n_head, d_head)
         """
         n_b, n_seq = query.shape[:2]
 
@@ -126,8 +131,10 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
             query.view(n_b, n_seq, self.n_query, self.n_head * self.d_head)
         )
 
-        # (n_b, n_seq, n_query, self.n_head * self.d_head)
-        return (sigma_q @ self.memory) / (sigma_q @ self.memory_norm)
+        # (n_b, n_seq, n_query * self.n_head, self.d_head)
+        return ((sigma_q @ self.memory) / (sigma_q @ self.memory_norm)).reshape(
+            n_b, n_seq, self.n_query * self.n_head, self.d_head
+        )
 
     def update_memory(self, key: torch.Tensor, value: torch.Tensor) -> None:
         """Apply Equations 8, 9 from https://arxiv.org/pdf/2404.07143 to update the context memory
@@ -137,6 +144,8 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
             key (torch.Tensor): attention key matrix of shape (n_b, n_seq, d_head * n_head).
             value (torch.Tensor): attention value matrix of shape (n_b, n_seq, d_head * n_head).
         """
+        print(key.shape)
+        print(value.shape)
         sigma_k = torch.nn.functional.elu(key)
         sigma_k_t = sigma_k.transpose(-2, -1)
 
@@ -145,7 +154,7 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
         )
 
         self.memory += torch.sum(batch_update, dim=0)
-        self.memory_norm += torch.sum(sigma_k, dim=(0, 1, 2))
+        self.memory_norm += torch.sum(sigma_k, dim=(0, 1)).unsqueeze(1)
 
     def calculate_recurrent_attention(
         self, attention_out: torch.Tensor, attention_memory: torch.Tensor
@@ -155,19 +164,15 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
 
         Args:
             attention_out (torch.Tensor): Attention output tensor `A_out` of shape
-                (n_b, n_seq, n_query, n_head, d_head).
+                (n_b, n_seq, n_query * n_head, d_head).
             attention_memory (torch.Tensor): Attention memory tensor `A_mem` of shape
-                (n_b, n_seq, n_query, n_head * d_head).
+                (n_b, n_seq, n_query * n_head * d_head).
+        Returns:
+            (torch.Tensor): local and context attention fused output
+                (n_b, n_seq, n_query * n_head * d_head).
         """
-        n_b, n_seq = attention_out.shape[:2]
-
-        # View the memory component in the same shape as the attention output.
-        attention_memory_view = attention_memory.view(
-            n_b, n_seq, self.n_query, self.n_head, self.d_head
-        )
-
         mem_weight = torch.nn.functional.sigmoid(self.memory_weight)
-        return attention_out * (1.0 - mem_weight) + attention_memory_view * mem_weight
+        return attention_out * (1.0 - mem_weight) + attention_memory * mem_weight
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Runs the forward pass, computing `n_head` attention heads with `n_query`
@@ -194,16 +199,16 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
         # (n_b, n_seq, d_model) @ (d_model, d_model) = (n_b, n_seq, d_model)
         query = self.query_proj(x)
 
-        # (n_b, n_seq, n_query, n_head, d_head)
-        attention_out = self.calculate_attention_output(query=query, key=key, value=value)
+        # (n_b, n_seq, n_query * n_head, d_head)
+        attention_out = self.scaled_dot_product_attention(query=query, key=key, value=value)
 
-        # (n_b, n_seq, n_query, n_head, d_head)
+        # (n_b, n_seq, n_query * n_head, d_head)
         attention_memory = self.calculate_memory_attention(query=query)
 
         # Update the memory matrix and normalization term in-place.
         self.update_memory(key=key, value=value)
 
-        # (n_b, n_seq, n_query, n_head, d_head) -> ((n_b, n_seq, d_model))
+        # (n_b, n_seq, n_query * n_head, d_head) -> ((n_b, n_seq, d_model))
         return self.calculate_recurrent_attention(
             attention_out=attention_out, attention_memory=attention_memory
         ).reshape(n_b, n_seq, self.d_model)
