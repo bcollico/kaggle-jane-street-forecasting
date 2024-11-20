@@ -14,7 +14,7 @@ sys.path.insert(0, parentdir)
 
 from attention_model.attention_model import GroupedRecurrentMultiHeadAttention
 
-N_RUNS = 100000
+N_RUNS = 1000
 
 
 def run_attention_model_bm():
@@ -28,22 +28,20 @@ def run_attention_model_bm():
     > 10s for a small amount of runs.
 
     See https://pytorch.org/tutorials/recipes/recipes/benchmark.html for details.
-    
+
     Last results ("naive" torch implementation is faster!):
-        <torch.utils.benchmark.utils.common.Measurement object at 0x75508013d840>
     torch.nn.functional.scaled_dot_product_attention(query=q, key=k, value=v, enable_gqa=True)
-    12.81 ms
-    1 measurement, 1000 runs , 1 thread
-    <torch.utils.benchmark.utils.common.Measurement object at 0x75508013d7e0>
+        16.68 ms
+        1 measurement, 1000 runs , 1 thread
     layer.scaled_dot_product_attention(query=query, key=key, value=value)
-    10.55 ms
-    1 measurement, 1000 runs , 1 thread
+        13.74 ms
+        1 measurement, 1000 runs , 1 thread
     """
 
     n_query = 4
     n_head = 8
-    d_head = 128
-    seq_len = 100
+    d_head = 1024
+    seq_len = 20
     batch_size = 100
     d_model = n_query * n_head * d_head
     layer = GroupedRecurrentMultiHeadAttention(
