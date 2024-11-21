@@ -41,13 +41,14 @@ class TestGRMHA(unittest.TestCase):
         layer_out = self.layer.scaled_dot_product_attention(query=query, key=key, value=value)
 
         # Check that the output shape is correct.
-        assert layer_out.shape == torch.Size(
-            [self.batch_size, self.seq_len, self.n_query * self.n_head, self.d_head]
+        self.assertEqual(
+            layer_out.shape,
+            torch.Size([self.batch_size, self.seq_len, self.n_query * self.n_head, self.d_head]),
         )
 
         # This test can fail if rtol is too low since we're dealing with very small values.
         # Check the that the result closely matches the torch implementation.
-        assert layer_out.allclose(torch_out, rtol=1.0)
+        self.assertTrue(layer_out.allclose(torch_out, rtol=1.0))
 
     def test_should_calculate_memory_correctly(self):
         """Test the memory retrieval from query."""
@@ -59,8 +60,9 @@ class TestGRMHA(unittest.TestCase):
         layer_attention_mem = self.layer.calculate_memory_attention(query)
 
         # Check the output shape.
-        assert layer_attention_mem.shape == torch.Size(
-            [self.batch_size, self.seq_len, self.n_head * self.n_query, self.d_head]
+        self.assertEqual(
+            layer_attention_mem.shape,
+            torch.Size([self.batch_size, self.seq_len, self.n_head * self.n_query, self.d_head]),
         )
 
         # reshape to look at each individual head.
@@ -83,7 +85,7 @@ class TestGRMHA(unittest.TestCase):
                         # Check that the manually calculated attention matches each head output
                         # of the calculation from the layer.
                         chunk = memory[self.d_head * h : self.d_head * (h + 1)]
-                        assert layer_attention_mem[b, s, q, h].allclose(chunk, rtol=1.0)
+                        self.assertTrue(layer_attention_mem[b, s, q, h].allclose(chunk, rtol=1.0))
 
     def test_should_update_memory(self):
         """Simple test to check that the memory update function still runs."""
@@ -96,7 +98,7 @@ class TestGRMHA(unittest.TestCase):
         x = torch.randn(self.batch_size, self.seq_len, self.d_model)
         out = self.layer(x=x)
 
-        assert out.shape == torch.Size([self.batch_size, self.seq_len, self.d_model])
+        self.assertEqual(out.shape, torch.Size([self.batch_size, self.seq_len, self.d_model]))
 
 
 if __name__ == "__main__":
