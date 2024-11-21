@@ -126,6 +126,8 @@ def run_attention_model_bm():
     layer.scaled_dot_product_attention(query=query, key=key, value=value)
         16.95 ms
         1 measurement, 1000 runs , 1 thread
+
+    NB: you get a speedup of about 25% by using torch.compile to optimize the SDPA functions.
     """
 
     run_rope()
