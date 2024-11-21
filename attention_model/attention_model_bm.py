@@ -19,28 +19,28 @@ from attention_model.attention_model import (
 
 N_RUNS = 1000
 
-n_query = 4
-n_head = 8
-d_head = 1024
-seq_len = 20
-batch_size = 10
-d_model = n_query * n_head * d_head
+N_QUERY = 4
+N_HEAD = 8
+D_HEAD = 1024
+SEQ_LEN = 20
+BATCH_SIZE = 50
+D_MODEL = N_QUERY * N_HEAD * D_HEAD
 
 
 def run_torch_scaled_attention():
     """Run torch attention without positional encoding."""
-    query = torch.randn(batch_size, seq_len, d_model).cuda()
-    key = torch.randn(batch_size, seq_len, d_head * n_head).cuda()
+    query = torch.randn(BATCH_SIZE, SEQ_LEN, D_MODEL).cuda()
+    key = torch.randn(BATCH_SIZE, SEQ_LEN, D_HEAD * N_HEAD).cuda()
     value = (
-        torch.randn(batch_size, seq_len, d_head * n_head)
+        torch.randn(BATCH_SIZE, SEQ_LEN, D_HEAD * N_HEAD)
         .cuda()
-        .reshape(batch_size, seq_len, n_head, -1)
+        .reshape(BATCH_SIZE, SEQ_LEN, N_HEAD, -1)
         .transpose(1, 2)
     )
 
-    key = key.reshape(batch_size, seq_len, n_head, -1).transpose(1, 2)
-    query = query.reshape(batch_size, seq_len, -1, d_head).transpose(1, 2)
-    value = value.reshape(batch_size, seq_len, n_head, -1).transpose(1, 2)
+    key = key.reshape(BATCH_SIZE, SEQ_LEN, N_HEAD, -1).transpose(1, 2)
+    query = query.reshape(BATCH_SIZE, SEQ_LEN, -1, D_HEAD).transpose(1, 2)
+    value = value.reshape(BATCH_SIZE, SEQ_LEN, N_HEAD, -1).transpose(1, 2)
 
     torch_time = bm.Timer(
         stmt=(
@@ -63,22 +63,22 @@ def run_torch_scaled_attention():
 def run_torch_scaled_attention_with_rope():
     """Run torch attention function with RoPE encoding."""
 
-    query = torch.randn(batch_size, seq_len, d_model).cuda()
-    key = torch.randn(batch_size, seq_len, d_head * n_head).cuda()
+    query = torch.randn(BATCH_SIZE, SEQ_LEN, D_MODEL).cuda()
+    key = torch.randn(BATCH_SIZE, SEQ_LEN, D_HEAD * N_HEAD).cuda()
     value = (
-        torch.randn(batch_size, seq_len, d_head * n_head)
+        torch.randn(BATCH_SIZE, SEQ_LEN, D_HEAD * N_HEAD)
         .cuda()
-        .reshape(batch_size, seq_len, n_head, -1)
+        .reshape(BATCH_SIZE, SEQ_LEN, N_HEAD, -1)
         .transpose(1, 2)
     )
 
-    rope = RotaryPositionalEncoding(d_model=d_model)
+    rope = RotaryPositionalEncoding(d_model=D_MODEL)
 
     torch_time = bm.Timer(
         stmt=(
             "torch.nn.functional.scaled_dot_product_attention("
-            "query=rope.forward(q).reshape(batch_size, seq_len, -1, d_head).transpose(1, 2), "
-            "key=rope.forward(k).reshape(batch_size, seq_len, n_head, -1).transpose(1, 2), "
+            "query=rope.forward(q).reshape(BATCH_SIZE, SEQ_LEN, -1, D_HEAD).transpose(1, 2), "
+            "key=rope.forward(k).reshape(BATCH_SIZE, SEQ_LEN, N_HEAD, -1).transpose(1, 2), "
             "value=v, enable_gqa=True)"
         ),
         globals={
@@ -86,10 +86,10 @@ def run_torch_scaled_attention_with_rope():
             "k": key,
             "v": value,
             "rope": rope,
-            "batch_size": batch_size,
-            "seq_len": seq_len,
-            "d_head": d_head,
-            "n_head": n_head,
+            "BATCH_SIZE": BATCH_SIZE,
+            "SEQ_LEN": SEQ_LEN,
+            "D_HEAD": D_HEAD,
+            "N_HEAD": N_HEAD,
         },
     )
 
@@ -98,15 +98,22 @@ def run_torch_scaled_attention_with_rope():
 
 def run_custom_layer_with_rope():
     """Run custom attention implementation with RoPE positional encoding."""
-    layer = GroupedRecurrentMultiHeadAttention(
-        d_model=d_model,
-        n_query=n_query,
-        n_head=n_head,
-    ).cuda()
 
-    query = torch.randn(batch_size, seq_len, d_model).cuda()
-    key = torch.randn(batch_size, seq_len, d_head * n_head).cuda()
-    value = torch.randn(batch_size, seq_len, d_head * n_head).cuda()
+    query = torch.randn(BATCH_SIZE, SEQ_LEN, D_MODEL).cuda()
+    key = torch.randn(BATCH_SIZE, SEQ_LEN, D_HEAD * N_HEAD).cuda()
+    value = torch.randn(BATCH_SIZE, SEQ_LEN, D_HEAD * N_HEAD).cuda()
+
+    # Instantiating and pre-computing the rope object does not change the
+    # timing compared to letting the layer instantiate it's own rope.
+    rope = RotaryPositionalEncoding(d_model=D_MODEL, device=key.device)
+    rope.forward(x=query)
+
+    layer = GroupedRecurrentMultiHeadAttention(
+        d_model=D_MODEL,
+        n_query=N_QUERY,
+        n_head=N_HEAD,
+        rope=rope,
+    ).cuda()
 
     layer_time = bm.Timer(
         stmt="layer.scaled_dot_product_attention(query=query, key=key, value=value)",
@@ -118,10 +125,11 @@ def run_custom_layer_with_rope():
 
 def run_rope():
     """Benchmark the positional encoding forward pass by itself."""
-    query = torch.randn(batch_size, seq_len, d_model).cuda()
-    key = torch.randn(batch_size, seq_len, d_head * n_head).cuda()
+    query = torch.randn(BATCH_SIZE, SEQ_LEN, D_MODEL).cuda()
+    key = torch.randn(BATCH_SIZE, SEQ_LEN, D_HEAD * N_HEAD).cuda()
 
-    rope = RotaryPositionalEncoding(d_model=d_model, device=key.device)
+    rope = RotaryPositionalEncoding(d_model=D_MODEL, device=key.device)
+    rope.forward(query)
 
     rope_time = bm.Timer(
         stmt="rope.forward(x=query), rope.forward(x=key)",
