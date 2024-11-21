@@ -179,19 +179,14 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
 
         # (n_b, n_head * n_query, d_head, n_seq)
         key_t = (
-            self.positional_encoding.forward(key)
-            .view(n_b, n_seq, self.n_head, self.d_head)
+            key.view(n_b, n_seq, self.n_head, self.d_head)
             .repeat_interleave(self.n_query, -2)
             .transpose(1, 2)
             .transpose(2, 3)
         )
 
         # (n_b, n_query * n_head, n_seq, d_head)
-        query_t = (
-            self.positional_encoding.forward(query)
-            .view(n_b, n_seq, self.n_query * self.n_head, self.d_head)
-            .transpose(1, 2)
-        )
+        query_t = query.view(n_b, n_seq, self.n_query * self.n_head, self.d_head).transpose(1, 2)
 
         # (n_b, n_query * n_head, n_seq, d_head)
         value_t = (
@@ -292,7 +287,11 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
         query = self.query_proj(x)
 
         # (n_b, n_seq, n_query * n_head, d_head)
-        attention_out = self.scaled_dot_product_attention(query=query, key=key, value=value)
+        attention_out = self.scaled_dot_product_attention(
+            query=self.positional_encoding.forward(query),
+            key=self.positional_encoding.forward(key),
+            value=value,
+        )
 
         # (n_b, n_seq, n_query * n_head, d_head)
         attention_memory = self.calculate_memory_attention(query=query)

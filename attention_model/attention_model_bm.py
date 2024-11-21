@@ -60,43 +60,7 @@ def run_torch_scaled_attention():
     print(torch_time.timeit(N_RUNS))
 
 
-def run_torch_scaled_attention_with_rope():
-    """Run torch attention function with RoPE encoding."""
-
-    query = torch.randn(BATCH_SIZE, SEQ_LEN, D_MODEL).cuda()
-    key = torch.randn(BATCH_SIZE, SEQ_LEN, D_HEAD * N_HEAD).cuda()
-    value = (
-        torch.randn(BATCH_SIZE, SEQ_LEN, D_HEAD * N_HEAD)
-        .cuda()
-        .reshape(BATCH_SIZE, SEQ_LEN, N_HEAD, -1)
-        .transpose(1, 2)
-    )
-
-    rope = RotaryPositionalEncoding(d_model=D_MODEL)
-
-    torch_time = bm.Timer(
-        stmt=(
-            "torch.nn.functional.scaled_dot_product_attention("
-            "query=rope.forward(q).reshape(BATCH_SIZE, SEQ_LEN, -1, D_HEAD).transpose(1, 2), "
-            "key=rope.forward(k).reshape(BATCH_SIZE, SEQ_LEN, N_HEAD, -1).transpose(1, 2), "
-            "value=v, enable_gqa=True)"
-        ),
-        globals={
-            "q": query,
-            "k": key,
-            "v": value,
-            "rope": rope,
-            "BATCH_SIZE": BATCH_SIZE,
-            "SEQ_LEN": SEQ_LEN,
-            "D_HEAD": D_HEAD,
-            "N_HEAD": N_HEAD,
-        },
-    )
-
-    print(torch_time.timeit(N_RUNS))
-
-
-def run_custom_layer_with_rope():
+def run_custom_layer():
     """Run custom attention implementation with RoPE positional encoding."""
 
     query = torch.randn(BATCH_SIZE, SEQ_LEN, D_MODEL).cuda()
@@ -112,7 +76,6 @@ def run_custom_layer_with_rope():
         d_model=D_MODEL,
         n_query=N_QUERY,
         n_head=N_HEAD,
-        rope=rope,
     ).cuda()
 
     layer_time = bm.Timer(
@@ -128,6 +91,8 @@ def run_rope():
     query = torch.randn(BATCH_SIZE, SEQ_LEN, D_MODEL).cuda()
     key = torch.randn(BATCH_SIZE, SEQ_LEN, D_HEAD * N_HEAD).cuda()
 
+    # Instantiating and pre-computing the rope object does not change the
+    # timing compared to letting the layer instantiate it's own rope.
     rope = RotaryPositionalEncoding(d_model=D_MODEL, device=key.device)
     rope.forward(query)
 
@@ -164,8 +129,7 @@ def run_attention_model_bm():
 
     run_rope()
     run_torch_scaled_attention()
-    run_torch_scaled_attention_with_rope()
-    run_custom_layer_with_rope()
+    run_custom_layer()
 
 
 if __name__ == "__main__":
