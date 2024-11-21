@@ -5,7 +5,7 @@ Memory mechanism based on Infini-attention: https://arxiv.org/pdf/2404.07143
 Grouped-Query Attention based on: https://arxiv.org/pdf/2305.13245
 """
 
-from typing import Optional
+from typing import Optional, Tuple
 import torch
 
 
@@ -88,7 +88,7 @@ class RotaryPositionalEncoding(torch.nn.Module):
         return out
 
 
-class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
+class GroupedQueryAttention(torch.nn.Module):
     """Class for a multi-headed grouped attention layer."""
 
     def __init__(
@@ -96,11 +96,22 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
         d_model: int,
         n_query: int,
         n_head: int,
+        dropout_pct: float = 0.0,
         rope: Optional[RotaryPositionalEncoding] = None,
     ) -> None:
         """
-        Initializes the GroupedRecurrentMultiHeadAttention with a single Key/Value projetion and
+        Initializes the GroupedQueryAttention with a single Key/Value projection and
         multiple query projection matrices.
+
+
+        Trainable parameters per layer:
+            attn projection: d_model * (d_model + 1)
+            query projection: d_model**2
+            key projection: d_model**2 / n_query
+            value projection: d_model**2 / n_query
+            memory mixing parameter: 1
+
+            Total = 2 * (1/n_query + 1) * d_model**2 + d_model + 1
 
         Args:
             d_model (int): The size of the input dimension for each vector. For multi-head
@@ -110,8 +121,10 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
                 of `d_model`.
             n_head (int): The number of heads in this multi-head attention layer. Must be a factor
                 of `d_model`.
-            mem_activation (torch.nn.Module): Torch module to apply as the `sigma` function when
-                calculating the memory component of the attention.
+            dropout_pct (float): Dropout probability applied to each element in the attention
+                probabilities before matmul with the Value matrix in SDPA function.
+            rope (torch.nn.Module): Rotary Positional Encoding instance to use. Allows for
+                sharing the sin/cos cache between layers.
         """
         super().__init__()
 
@@ -124,6 +137,8 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
         self.d_model = d_model
         self.n_query = n_query
         self.n_head = n_head
+
+        self.attn_dropout = torch.nn.Dropout(p=dropout_pct)
 
         self.mem_activation = torch.nn.ELU()
         self.positional_encoding = RotaryPositionalEncoding(d_model=d_model) if not rope else rope
@@ -144,24 +159,17 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
 
         #  (d_model, d_model) projection matrix
         self.query_proj = torch.nn.Linear(in_features=d_model, out_features=d_model, bias=False)
+        
+        # (d_model, d_model) projection matrix
+        self.attn_proj = torch.nn.Linear(in_features=d_model, out_features=d_model)
 
         # Scaled attention uses the feature length for each query.
         self.attention_scale = 1.0 / torch.sqrt(torch.tensor(self.d_head))
 
-        # Memory parameters. Keep a feature-length memory matrix and normalization vector for each
-        # head.
-        self.memory = torch.zeros((self.d_head * n_head, self.d_head * n_head))
-        self.memory_norm = torch.ones((self.d_head * n_head))
-
-        # Scalar parameter for mixing the attention scores from the current forward pass with the
-        # memory context.
-        self.memory_weight = torch.nn.Parameter(data=torch.Tensor([1.0]), requires_grad=True)
-
     def scaled_dot_product_attention(
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
     ) -> torch.Tensor:
-        """Apply Equation 6 from https://arxiv.org/pdf/2404.07143 to calculate the `A_dot`
-        attention output matrix.
+        """Apply SDPA using grouped query attention from https://arxiv.org/pdf/2305.13245.
 
         Args:
             query (torch.Tensor):: attention query matrix of shape (n_b, n_seq, d_model) where
@@ -170,7 +178,8 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
             value (torch.Tensor): attention value matrix of shape (n_b, n_seq, d_head * n_head).
 
         Returns:
-            (torch.Tensor): Attention output of shape (n_b, n_seq, n_query * n_head, d_head).
+            attention_output (torch.Tensor): Attention output of shape
+                (n_b, n_seq, n_query * n_head, d_head).
         """
         n_b, n_seq = query.shape[:2]
 
@@ -198,9 +207,115 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
         # (n_b, n_query * n_head, n_seq, n_seq)
         attention_scores = query_t @ key_t * self.attention_scale
         attention_probabilities = torch.nn.functional.softmax(attention_scores, dim=-1)
-
+        
         # (n_b, n_query * n_head, n_seq, d_head) -> (n_b, n_seq, n_query * n_head, d_head)
-        return (attention_probabilities @ value_t).transpose(1, 2)
+        return (self.attn_dropout(attention_probabilities) @ value_t).transpose(1, 2)
+
+    def calculate_attention_output(
+        self, x: torch.Tensor, return_qkv: bool = False
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Calculate the attention output using scaled dot product attention.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (n_b, n_seq, d_model).
+            return_qkv (bool): Return the query, key, and value matrices (in that order) in addition
+                to the the attention output
+        Output:
+            attention_output (torch.Tensor): Attention output of shape
+                (n_b, n_seq, n_query * n_head, d_head)
+
+        """
+        # (n_b, n_seq, d_model) @ (d_model, d_head * n_head) = (n_b, n_seq, d_head * n_head)
+        key = self.key_proj(x)
+
+        # (n_b, n_seq, d_model) @ (d_model, d_head * n_head) = (n_b, n_seq, d_head * n_head)
+        value = self.value_proj(x)
+
+        # (n_b, n_seq, d_model) @ (d_model, d_model) = (n_b, n_seq, d_model)
+        query = self.query_proj(x)
+
+        attention_output = self.scaled_dot_product_attention(
+            query=self.positional_encoding.forward(query),
+            key=self.positional_encoding.forward(key),
+            value=value,
+        )
+
+        if return_qkv:
+            return attention_output, query, key, value
+
+        # (n_b, n_seq, n_query * n_head, d_head)
+        return attention_output
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Runs the forward pass, computing `n_head` attention heads with `n_query`
+        queries per head. If enabled uses the memory mechanism to mix the local attention
+        output with the memory attention.
+
+        Args:
+            x (torch.Tensor): Batched tensor of shape (n_b, n_seq, d_model)
+        Returns:
+            (torch.Tensor): Batched tensor of shape (n_b, n_seq, d_model)
+        """
+
+        n_b, n_seq, d_model = x.shape
+
+        # (n_b, n_seq, n_query * n_head, d_head)
+        attention_out = self.calculate_attention_output(x=x)
+
+        # (n_b, n_seq, n_query * n_head, d_head) -> ((n_b, n_seq, d_model))
+        return self.attn_proj(attention_out.view(n_b, n_seq, d_model))
+
+
+class InfiniGroupedQueryAttention(GroupedQueryAttention):
+    """Class for a multi-headed grouped attention layer."""
+
+    def __init__(
+        self,
+        d_model: int,
+        n_query: int,
+        n_head: int,
+        dropout_pct: float = 0.0,
+        rope: Optional[RotaryPositionalEncoding] = None,
+    ) -> None:
+        """
+        Initializes the InfiniGroupedQueryAttention with a single Key/Value projection and
+        multiple query projection matrices per head.
+
+
+        Trainable parameters per layer:
+            attn projection: d_model * (d_model + 1)
+            query projection: d_model**2
+            key projection: d_model**2 / n_query
+            value projection: d_model**2 / n_query
+            memory mixing parameter: 1
+
+            Total = 2 * (1/n_query + 1) * d_model**2 + d_model + 1
+
+        Args:
+            d_model (int): The size of the input dimension for each vector. For multi-head
+                attention, the feature length for each query is (`d_model / n_head / n_query`).
+            n_out (int): The size of the output dimension for each projection.
+            n_query (int): The number of query projections to apply on head head. Must be a factor
+                of `d_model`.
+            n_head (int): The number of heads in this multi-head attention layer. Must be a factor
+                of `d_model`.
+            dropout_pct (float): Dropout probability applied to each element in the attention
+                probabilities before matmul with the Value matrix in SDPA function.
+            rope (torch.nn.Module): Rotary Positional Encoding instance to use. Allows for
+                sharing the sin/cos cache between layers.
+        """
+        super().__init__(
+            d_model=d_model, n_query=n_query, n_head=n_head, dropout_pct=dropout_pct, rope=rope
+        )
+
+        # Memory parameters. Keep a feature-length memory matrix and normalization vector for each
+        # head.
+        self.memory = torch.zeros((self.d_head * n_head, self.d_head * n_head))
+        self.memory_norm = torch.ones((self.d_head * n_head))
+
+        # Scalar parameter for mixing the attention scores from the current forward pass with the
+        # memory context.
+        self.memory_weight = torch.nn.Parameter(data=torch.Tensor([1.0]), requires_grad=True)
 
     def calculate_memory_attention(self, query: torch.Tensor) -> torch.Tensor:
         """Computes Equation 7 from https://arxiv.org/pdf/2404.07143 to get the memory component
@@ -275,21 +390,8 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
 
         n_b, n_seq, d_model = x.shape
 
-        # (n_b, n_seq, d_model) @ (d_model, d_head * n_head) = (n_b, n_seq, d_head * n_head)
-        key = self.key_proj(x)
-
-        # (n_b, n_seq, d_model) @ (d_model, d_head * n_head) = (n_b, n_seq, d_head * n_head)
-        value = self.value_proj(x)
-
-        # (n_b, n_seq, d_model) @ (d_model, d_model) = (n_b, n_seq, d_model)
-        query = self.query_proj(x)
-
         # (n_b, n_seq, n_query * n_head, d_head)
-        attention_out = self.scaled_dot_product_attention(
-            query=self.positional_encoding.forward(query),
-            key=self.positional_encoding.forward(key),
-            value=value,
-        )
+        attention_out, query, key, value = self.calculate_attention_output(x=x, return_qkv=True)
 
         # (n_b, n_seq, n_query * n_head, d_head)
         attention_memory = self.calculate_memory_attention(query=query)
@@ -298,6 +400,8 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
         self.update_memory(key=key, value=value)
 
         # (n_b, n_seq, n_query * n_head, d_head) -> ((n_b, n_seq, d_model))
-        return self.calculate_recurrent_attention(
-            attention_out=attention_out, attention_memory=attention_memory
-        ).reshape(n_b, n_seq, d_model)
+        return self.attn_proj(
+            self.calculate_recurrent_attention(
+                attention_out=attention_out, attention_memory=attention_memory
+            ).reshape(n_b, n_seq, d_model)
+        )

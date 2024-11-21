@@ -1,7 +1,7 @@
 import unittest
 import torch
 import torch.nn.functional as f
-from attention_model.attention_model import GroupedRecurrentMultiHeadAttention
+from attention_model.attention_model import InfiniGroupedQueryAttention
 
 
 class TestGRMHA(unittest.TestCase):
@@ -15,7 +15,7 @@ class TestGRMHA(unittest.TestCase):
         self.n_head = 12
         self.d_head = 30
         self.d_model = self.n_query * self.n_head * self.d_head
-        self.layer = GroupedRecurrentMultiHeadAttention(
+        self.layer = InfiniGroupedQueryAttention(
             d_model=self.d_model,
             n_query=self.n_query,
             n_head=self.n_head,

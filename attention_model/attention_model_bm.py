@@ -13,17 +13,18 @@ parentdir = os.path.dirname(currentdir)
 sys.path.insert(0, parentdir)
 
 from attention_model.attention_model import (
-    GroupedRecurrentMultiHeadAttention,
+    InfiniGroupedQueryAttention,
     RotaryPositionalEncoding,
 )
 
 N_RUNS = 1000
 
-N_QUERY = 4
-N_HEAD = 8
-D_HEAD = 1024
-SEQ_LEN = 20
-BATCH_SIZE = 100
+N_QUERY = 8
+N_HEAD = 4
+D_HEAD = 64
+SEQ_LEN = 200
+BATCH_SIZE = 10
+
 D_MODEL = N_QUERY * N_HEAD * D_HEAD
 
 
@@ -70,9 +71,10 @@ def run_custom_layer():
     # Instantiating and pre-computing the rope object does not change the
     # timing compared to letting the layer instantiate it's own rope.
     rope = RotaryPositionalEncoding(d_model=D_MODEL, device=key.device)
+
     rope.forward(x=query)
 
-    layer = GroupedRecurrentMultiHeadAttention(
+    layer = InfiniGroupedQueryAttention(
         d_model=D_MODEL,
         n_query=N_QUERY,
         n_head=N_HEAD,
