@@ -19,6 +19,7 @@ class TestGRMHA(unittest.TestCase):
         )
 
     def test_check_scaled_dot_product_attention(self):
+        """Check that custom scaled dot product attention matches torch implementation."""
         batch_size = 2
         seq_len = 5
         query = torch.randn(batch_size, seq_len, self.d_model)
@@ -26,26 +27,17 @@ class TestGRMHA(unittest.TestCase):
         value = torch.randn(batch_size, seq_len, self.d_head * self.n_head)
 
         torch_out = f.scaled_dot_product_attention(
-            query=query.reshape(batch_size, seq_len, self.n_head * self.n_query, -1).transpose(
-                1, 2
-            ),
-            key=key.reshape(batch_size, seq_len, self.n_head, -1).transpose(1, 2),
-            value=value.reshape(batch_size, seq_len, self.n_head, -1).transpose(1, 2),
+            query=query.view(
+                batch_size, seq_len, self.n_head * self.n_query, self.d_head
+            ).transpose(1, 2),
+            key=key.view(batch_size, seq_len, self.n_head, self.d_head).transpose(1, 2),
+            value=value.view(batch_size, seq_len, self.n_head, self.d_head).transpose(1, 2),
             enable_gqa=True,
         ).transpose(1, 2)
 
         layer_out = self.layer.scaled_dot_product_attention(query=query, key=key, value=value)
 
-        # The order of the output matrices will be out of order compared to the torch
-        # implementation since they use `torch.repeat_interleave` whereas my implementation
-        # takes more of a `torch.tile` approach.
-
-
-        for torch_idx in range(self.n_head * self.n_query):
-            out = []
-            for layer_idx in range(self.n_head * self.n_query):
-                out.append(torch.norm(layer_out[:,:,layer_idx,:] - (torch_out[:,:,torch_idx,:])).item())
-            print(min(out))
+        assert layer_out.allclose(torch_out)
 
 
 if __name__ == "__main__":

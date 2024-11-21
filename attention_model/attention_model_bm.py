@@ -29,13 +29,15 @@ def run_attention_model_bm():
 
     See https://pytorch.org/tutorials/recipes/recipes/benchmark.html for details.
 
-    Last results ("naive" torch implementation is faster!):
+    Last results (they are about the same):
+    <torch.utils.benchmark.utils.common.Measurement object at 0x737c62d416f0>
     torch.nn.functional.scaled_dot_product_attention(query=q, key=k, value=v, enable_gqa=True)
-        16.68 ms
-        1 measurement, 1000 runs , 1 thread
+    16.47 ms
+    1 measurement, 1000 runs , 1 thread
+    <torch.utils.benchmark.utils.common.Measurement object at 0x737c62d425c0>
     layer.scaled_dot_product_attention(query=query, key=key, value=value)
-        13.74 ms
-        1 measurement, 1000 runs , 1 thread
+    16.69 ms
+    1 measurement, 1000 runs , 1 thread
     """
 
     n_query = 4
