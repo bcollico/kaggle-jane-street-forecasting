@@ -273,8 +273,6 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
             (torch.Tensor): Batched tensor of shape (n_b, n_seq, d_model)
         """
 
-        # TODO: positional encoding/embedding.
-
         n_b, n_seq, d_model = x.shape
 
         # (n_b, n_seq, d_model) @ (d_model, d_head * n_head) = (n_b, n_seq, d_head * n_head)
