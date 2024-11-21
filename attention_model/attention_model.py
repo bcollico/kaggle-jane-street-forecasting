@@ -5,7 +5,87 @@ Memory mechanism based on Infini-attention: https://arxiv.org/pdf/2404.07143
 Grouped-Query Attention based on: https://arxiv.org/pdf/2305.13245
 """
 
+from typing import Optional
 import torch
+
+
+class RotaryPositionalEncoding(torch.nn.Module):
+    """Vanilla Rotary Positional Encoding (RoPE) implementation: https://arxiv.org/pdf/2104.09864"""
+
+    def __init__(
+        self, d_model: int, base: int = 10000, device: torch.DeviceObjType = torch.device("cuda")
+    ):
+        """
+        Args:
+            d_model (int): Expected length of the input token embeddings.
+            base (int): Base value to raised to the power of -2i/d_model.
+        """
+        super().__init__()
+
+        # d_model needs to be even.
+        assert d_model % 2 == 0
+
+        d_model_2: int = int(d_model / 2)
+        self.sin_pos: torch.Tensor = torch.empty(0, d_model_2).to(device)
+        self.cos_pos: torch.Tensor = torch.empty(0, d_model_2).to(device)
+
+        # theta parameter vector: (1, d_model / 2)
+        self.theta = torch.tensor(base, device=device) ** (
+            -torch.arange(d_model_2, device=device) / (d_model_2)
+        ).unsqueeze(0)
+
+    def _allocate_sin_cos(self, seq_len: int) -> None:
+        """Allocate sin cos caches for rotary positional encoding. Only calculates
+        the part of the positional encoding that is not yet stored in the cache. If the input
+        len is less than the current cache size, no-ops.
+
+        Args:
+            seq_len (int): Length of the sequence to precompute the positional encoding for.
+        """
+
+        start = self.sin_pos.shape[0]
+
+        if start >= seq_len:
+            return
+
+        # Absolute indices in the sequence: (seq_len, 1)
+        position = torch.arange(start=start, end=seq_len, device=self.sin_pos.device).unsqueeze(1)
+
+        # Parameterized angles: (seq_len, d_model / 2)
+        angles = position * self.theta
+
+        # Stack the new values in the sin/cos caches.
+        self.sin_pos = torch.vstack((self.sin_pos, torch.sin(angles)))
+        self.cos_pos = torch.vstack((self.cos_pos, torch.sin(angles)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Applies the positional encoding to the input tensor. Updates the
+        sin/cos cache if necessary.
+
+        Args:
+            x (torch.Tensor): Tensor of shape (..., seq_len, d_model)
+        Returns:
+            out (torch.Tensor): Tensor of shape (..., seq_len, d_model) with positional encoding.
+        """
+
+        # Update the cache if necessary.
+        seq_len, d_model = x.shape[-2], x.shape[-1]
+        d_model_2: int = int(d_model / 2)
+        self._allocate_sin_cos(seq_len=seq_len)
+
+        self.sin_pos = self.sin_pos.to(x.device)
+        self.cos_pos = self.cos_pos.to(x.device)
+
+        x_even, x_odd = x[..., ::2], x[..., 1::2]
+
+        cos_pos: torch.Tensor = self.cos_pos[:seq_len, :d_model_2]
+        sin_pos: torch.Tensor = self.sin_pos[:seq_len, :d_model_2]
+
+        out = torch.empty_like(x)
+        out[..., ::2] = x_even * cos_pos - x_odd * sin_pos
+        out[..., 1::2] = x_odd * cos_pos + x_even * sin_pos
+
+        return out
 
 
 class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
@@ -15,8 +95,8 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
         self,
         d_model: int,
         n_query: int,
-        n_head,
-        mem_activation: torch.nn.Module = torch.nn.ELU(),
+        n_head: int,
+        rope: Optional[RotaryPositionalEncoding] = None,
     ) -> None:
         """
         Initializes the GroupedRecurrentMultiHeadAttention with a single Key/Value projetion and
@@ -28,7 +108,7 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
             n_out (int): The size of the output dimension for each projection.
             n_query (int): The number of query projections to apply on head head. Must be a factor
                 of `d_model`.
-            n_head(int): The number of heads in this multi-head attention layer. Must be a factor
+            n_head (int): The number of heads in this multi-head attention layer. Must be a factor
                 of `d_model`.
             mem_activation (torch.nn.Module): Torch module to apply as the `sigma` function when
                 calculating the memory component of the attention.
@@ -45,7 +125,8 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
         self.n_query = n_query
         self.n_head = n_head
 
-        self.mem_activation: torch.nn.Module = mem_activation
+        self.mem_activation = torch.nn.ELU()
+        self.positional_encoding = RotaryPositionalEncoding(d_model=d_model) if not rope else rope
 
         # The feature length per query in each head. Add 0.5 before casting to int to avoid
         # unexpected rounding behavior due to float-precision
@@ -98,14 +179,19 @@ class GroupedRecurrentMultiHeadAttention(torch.nn.Module):
 
         # (n_b, n_head * n_query, d_head, n_seq)
         key_t = (
-            key.view(n_b, n_seq, self.n_head, self.d_head)
+            self.positional_encoding.forward(key)
+            .view(n_b, n_seq, self.n_head, self.d_head)
             .repeat_interleave(self.n_query, -2)
             .transpose(1, 2)
             .transpose(2, 3)
         )
 
         # (n_b, n_query * n_head, n_seq, d_head)
-        query_t = query.view(n_b, n_seq, self.n_query * self.n_head, self.d_head).transpose(1, 2)
+        query_t = (
+            self.positional_encoding.forward(query)
+            .view(n_b, n_seq, self.n_query * self.n_head, self.d_head)
+            .transpose(1, 2)
+        )
 
         # (n_b, n_query * n_head, n_seq, d_head)
         value_t = (
