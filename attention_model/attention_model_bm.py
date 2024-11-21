@@ -23,7 +23,7 @@ N_QUERY = 4
 N_HEAD = 8
 D_HEAD = 1024
 SEQ_LEN = 20
-BATCH_SIZE = 50
+BATCH_SIZE = 100
 D_MODEL = N_QUERY * N_HEAD * D_HEAD
 
 
@@ -116,15 +116,16 @@ def run_attention_model_bm():
 
     See https://pytorch.org/tutorials/recipes/recipes/benchmark.html for details.
 
-    Last results (they are about the same):
-    <torch.utils.benchmark.utils.common.Measurement object at 0x737c62d416f0>
+    Last results:
+    rope.forward(x=query), rope.forward(x=key)
+        16.24 ms
+        1 measurement, 1000 runs , 1 thread
     torch.nn.functional.scaled_dot_product_attention(query=q, key=k, value=v, enable_gqa=True)
-    16.47 ms
-    1 measurement, 1000 runs , 1 thread
-    <torch.utils.benchmark.utils.common.Measurement object at 0x737c62d425c0>
+        16.81 ms
+        1 measurement, 1000 runs , 1 thread
     layer.scaled_dot_product_attention(query=query, key=key, value=value)
-    16.69 ms
-    1 measurement, 1000 runs , 1 thread
+        16.95 ms
+        1 measurement, 1000 runs , 1 thread
     """
 
     run_rope()
