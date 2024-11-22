@@ -159,7 +159,7 @@ class GroupedQueryAttention(torch.nn.Module):
 
         #  (d_model, d_model) projection matrix
         self.query_proj = torch.nn.Linear(in_features=d_model, out_features=d_model, bias=False)
-        
+
         # (d_model, d_model) projection matrix
         self.attn_proj = torch.nn.Linear(in_features=d_model, out_features=d_model)
 
@@ -190,8 +190,7 @@ class GroupedQueryAttention(torch.nn.Module):
         key_t = (
             key.view(n_b, n_seq, self.n_head, self.d_head)
             .repeat_interleave(self.n_query, -2)
-            .transpose(1, 2)
-            .transpose(2, 3)
+            .permute(0, 2, 3, 1)
         )
 
         # (n_b, n_query * n_head, n_seq, d_head)
@@ -207,7 +206,7 @@ class GroupedQueryAttention(torch.nn.Module):
         # (n_b, n_query * n_head, n_seq, n_seq)
         attention_scores = query_t @ key_t * self.attention_scale
         attention_probabilities = torch.nn.functional.softmax(attention_scores, dim=-1)
-        
+
         # (n_b, n_query * n_head, n_seq, d_head) -> (n_b, n_seq, n_query * n_head, d_head)
         return (self.attn_dropout(attention_probabilities) @ value_t).transpose(1, 2)
 

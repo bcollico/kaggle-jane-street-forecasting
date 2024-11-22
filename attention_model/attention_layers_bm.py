@@ -12,7 +12,7 @@ currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentfram
 parentdir = os.path.dirname(currentdir)
 sys.path.insert(0, parentdir)
 
-from attention_model.attention_model import (
+from attention_model.attention_layers import (
     InfiniGroupedQueryAttention,
     RotaryPositionalEncoding,
 )
@@ -106,7 +106,7 @@ def run_rope():
     print(rope_time.timeit(N_RUNS))
 
 
-def run_attention_model_bm():
+def run_attention_layers_bm():
     """Runs two implementations of scaled_dot_product_attention for grouped query
     attention and prints their timing output to console.
 
@@ -138,4 +138,4 @@ def run_attention_model_bm():
 
 
 if __name__ == "__main__":
-    run_attention_model_bm()
+    run_attention_layers_bm()
