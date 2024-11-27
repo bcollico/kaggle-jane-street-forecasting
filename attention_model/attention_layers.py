@@ -1,5 +1,4 @@
 """Transformer model with Grouped Multi-Head Attention and compressed KV memory.
-TODO: There are MHA and Attention implementations in pytorch that I should benchmark against.
 
 Memory mechanism based on Infini-attention: https://arxiv.org/pdf/2404.07143
 Grouped-Query Attention based on: https://arxiv.org/pdf/2305.13245
@@ -7,6 +6,33 @@ Grouped-Query Attention based on: https://arxiv.org/pdf/2305.13245
 
 from typing import Optional, Tuple
 import torch
+
+
+class SwiGLUFeedForward(torch.nn.Module):
+    """SwiGLU implementation following https://kikaben.com/swiglu-2020/"""
+
+    def __init__(self, n_feat: int, n_feat_exp: int, swish_beta: float = 1.0) -> None:
+        super().__init__()
+
+        self.linear1 = torch.nn.Linear(in_features=n_feat, out_features=n_feat_exp)
+        self.swiglu_gate = torch.nn.Linear(in_features=n_feat, out_features=n_feat_exp)
+        self.linear2 = torch.nn.Linear(in_features=n_feat_exp, out_features=n_feat)
+
+        self.swish = lambda x, b: x * torch.nn.functional.sigmoid(b * x)
+        self.swish_beta = torch.tensor(swish_beta)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """SwiGLU feed-forward: (swish(xW+b) * (xV+c))U + d
+
+        Args:
+            x (torch.Tensor): Input tensor (..., n_feat)
+
+        Returns:
+            output (torch.Tensor): Output tensor (..., n_feat)
+        """
+        gate_tensor = self.swiglu_gate(x)
+        x = self.swish(self.linear1(x), self.swish_beta)
+        return self.linear2(x * gate_tensor)
 
 
 class RotaryPositionalEncoding(torch.nn.Module):
@@ -140,7 +166,6 @@ class GroupedQueryAttention(torch.nn.Module):
 
         self.attn_dropout = torch.nn.Dropout(p=dropout_pct)
 
-        self.mem_activation = torch.nn.ELU()
         self.positional_encoding = RotaryPositionalEncoding(d_model=d_model) if not rope else rope
 
         # The feature length per query in each head. Add 0.5 before casting to int to avoid
@@ -167,7 +192,11 @@ class GroupedQueryAttention(torch.nn.Module):
         self.attention_scale = 1.0 / torch.sqrt(torch.tensor(self.d_head))
 
     def scaled_dot_product_attention(
-        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Apply SDPA using grouped query attention from https://arxiv.org/pdf/2305.13245.
 
@@ -176,6 +205,7 @@ class GroupedQueryAttention(torch.nn.Module):
                 d_model = n_query * n_head * d_head
             key (torch.Tensor): attention key matrix of shape (n_b, n_seq, d_head * n_head).
             value (torch.Tensor): attention value matrix of shape (n_b, n_seq, d_head * n_head).
+            mask (torch.Tensor | None) Optional mask of shape (n_seq, n_seq) for casual attention.
 
         Returns:
             attention_output (torch.Tensor): Attention output of shape
@@ -205,30 +235,42 @@ class GroupedQueryAttention(torch.nn.Module):
 
         # (n_b, n_query * n_head, n_seq, n_seq)
         attention_scores = query_t @ key_t * self.attention_scale
+        if mask:
+            attention_scores = torch.masked_fill(attention_scores, mask, value=float("-inf"))
         attention_probabilities = torch.nn.functional.softmax(attention_scores, dim=-1)
 
         # (n_b, n_query * n_head, n_seq, d_head) -> (n_b, n_seq, n_query * n_head, d_head)
         return (self.attn_dropout(attention_probabilities) @ value_t).transpose(1, 2)
 
     def calculate_attention_output(
-        self, x: torch.Tensor, return_qkv: bool = False
+        self,
+        x: torch.Tensor,
+        y: Optional[torch.Tensor] = None,
+        return_qkv: bool = False,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Calculate the attention output using scaled dot product attention.
 
         Args:
             x (torch.Tensor): Input tensor of shape (n_b, n_seq, d_model).
+            y (torch.Tensor): Optional batched tensor of shape (n_b, n_seq, d_model), if present,
+                the layer calculates cross-attention between x and y by using x to compute the query
+                and y to compute the keys and values.
             return_qkv (bool): Return the query, key, and value matrices (in that order) in addition
                 to the the attention output
+            mask (torch.Tensor | None) Optional mask of shape (n_seq, n_seq) for casual attention.
         Output:
             attention_output (torch.Tensor): Attention output of shape
                 (n_b, n_seq, n_query * n_head, d_head)
 
         """
-        # (n_b, n_seq, d_model) @ (d_model, d_head * n_head) = (n_b, n_seq, d_head * n_head)
-        key = self.key_proj(x)
+        y = x if y is None else y
 
         # (n_b, n_seq, d_model) @ (d_model, d_head * n_head) = (n_b, n_seq, d_head * n_head)
-        value = self.value_proj(x)
+        key = self.key_proj(y)
+
+        # (n_b, n_seq, d_model) @ (d_model, d_head * n_head) = (n_b, n_seq, d_head * n_head)
+        value = self.value_proj(y)
 
         # (n_b, n_seq, d_model) @ (d_model, d_model) = (n_b, n_seq, d_model)
         query = self.query_proj(x)
@@ -237,6 +279,7 @@ class GroupedQueryAttention(torch.nn.Module):
             query=self.positional_encoding.forward(query),
             key=self.positional_encoding.forward(key),
             value=value,
+            mask=mask,
         )
 
         if return_qkv:
@@ -245,13 +288,19 @@ class GroupedQueryAttention(torch.nn.Module):
         # (n_b, n_seq, n_query * n_head, d_head)
         return attention_output
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, y: Optional[torch.Tensor], mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """Runs the forward pass, computing `n_head` attention heads with `n_query`
         queries per head. If enabled uses the memory mechanism to mix the local attention
         output with the memory attention.
 
         Args:
             x (torch.Tensor): Batched tensor of shape (n_b, n_seq, d_model)
+            y (torch.Tensor): Optional batched tensor of shape (n_b, n_seq, d_model), if present,
+                the layer calculates cross-attention between x and y by using x to compute the query
+                and y to compute the keys and values.
+            mask (torch.Tensor | None) Optional mask of shape (n_seq, n_seq) for casual attention.
         Returns:
             (torch.Tensor): Batched tensor of shape (n_b, n_seq, d_model)
         """
@@ -259,7 +308,7 @@ class GroupedQueryAttention(torch.nn.Module):
         n_b, n_seq, d_model = x.shape
 
         # (n_b, n_seq, n_query * n_head, d_head)
-        attention_out = self.calculate_attention_output(x=x)
+        attention_out = self.calculate_attention_output(x=x, y=y, mask=mask)
 
         # (n_b, n_seq, n_query * n_head, d_head) -> ((n_b, n_seq, d_model))
         return self.attn_proj(attention_out.view(n_b, n_seq, d_model))
@@ -306,6 +355,8 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
         super().__init__(
             d_model=d_model, n_query=n_query, n_head=n_head, dropout_pct=dropout_pct, rope=rope
         )
+
+        self.mem_activation = torch.nn.ELU()
 
         # Memory parameters. Keep a feature-length memory matrix and normalization vector for each
         # head.
@@ -376,13 +427,20 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
         mem_weight = torch.nn.functional.sigmoid(self.memory_weight)
         return attention_out * (1.0 - mem_weight) + attention_memory * mem_weight
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, y: Optional[torch.Tensor] = None, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """Runs the forward pass, computing `n_head` attention heads with `n_query`
         queries per head. If enabled uses the memory mechanism to mix the local attention
         output with the memory attention.
 
         Args:
             x (torch.Tensor): Batched tensor of shape (n_b, n_seq, d_model)
+            y (torch.Tensor): Optional batched tensor of shape (n_b, n_seq, d_model), if present,
+                the layer calculates cross-attention between x and y by using x to compute the query
+                and y to compute the keys and values.
+            mask (torch.Tensor | None) Optional mask of shape (n_seq, n_seq) for casual attention.
+
         Returns:
             (torch.Tensor): Batched tensor of shape (n_b, n_seq, d_model)
         """
@@ -390,7 +448,9 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
         n_b, n_seq, d_model = x.shape
 
         # (n_b, n_seq, n_query * n_head, d_head)
-        attention_out, query, key, value = self.calculate_attention_output(x=x, return_qkv=True)
+        attention_out, query, key, value = self.calculate_attention_output(
+            x=x, y=y, return_qkv=True, mask=mask
+        )
 
         # (n_b, n_seq, n_query * n_head, d_head)
         attention_memory = self.calculate_memory_attention(query=query)
