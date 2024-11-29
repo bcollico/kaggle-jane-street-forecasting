@@ -235,7 +235,7 @@ class GroupedQueryAttention(torch.nn.Module):
 
         # (n_b, n_query * n_head, n_seq, n_seq)
         attention_scores = query_t @ key_t * self.attention_scale
-        if mask:
+        if mask is not None:
             attention_scores = torch.masked_fill(attention_scores, mask, value=float("-inf"))
         attention_probabilities = torch.nn.functional.softmax(attention_scores, dim=-1)
 
@@ -311,7 +311,7 @@ class GroupedQueryAttention(torch.nn.Module):
         attention_out = self.calculate_attention_output(x=x, y=y, mask=mask)
 
         # (n_b, n_seq, n_query * n_head, d_head) -> ((n_b, n_seq, d_model))
-        return self.attn_proj(attention_out.view(n_b, n_seq, d_model))
+        return self.attn_proj(attention_out.reshape(n_b, n_seq, d_model))
 
 
 class InfiniGroupedQueryAttention(GroupedQueryAttention):
