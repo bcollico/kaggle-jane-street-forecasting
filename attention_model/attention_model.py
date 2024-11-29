@@ -75,14 +75,14 @@ class TransformerBlock(torch.nn.Module):
 
 class TransformerModel(torch.nn.Module):
     """Full decoder-only transformer architecture. Accepts input features and lagged responders and
-    outputs a discrete probability distribution and predicted 
-    
+    outputs a discrete probability distribution and predicted
+
     Architecture:
         input = features, lagged responders
         Create embeddings: input -> linear projection -> embedding
-        Cross attention: 
-            feature_embedding ->  keys, values
-            responder_embedding -> queries
+        Cross attention:
+            feature_embedding ->  key projection, value projection -> keys, values
+            responder_embedding -> query projection -> queries
         `n_blocks` self attention blocks
         Predict:
             Distribution over responder variables as discrete PDF with `n_bins` bins.
@@ -140,6 +140,10 @@ class TransformerModel(torch.nn.Module):
         self.offset_linear = torch.nn.Linear(in_features=d_model, out_features=n_output_bins)
         self.softmax = torch.nn.Softmax(dim=-1)
 
+        # TODO rethink this cross attention situation -- since we're assuming that the responder at
+        # t is paired with the feature at t+1, we could just so regular self-attention all the way
+        # through. Could also see if there is benefit to interleaving cross attention with the
+        # lagged responders  and features throughout
         self.cross_attn_layer = TransformerBlock(
             n_head=n_head,
             n_query=n_query,
