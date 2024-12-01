@@ -1,8 +1,10 @@
 """Torch dataset definition."""
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from dataclasses import dataclass
+
+from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -18,6 +20,12 @@ def _get_cumulative_counts(raw_counts: List[int]) -> np.ndarray:
     List is returned as a numpy array to support np.searchsorted.
     """
     return np.array([sum(raw_counts[:i]) for i in range(len(raw_counts))])
+
+
+def _calculate_index_from_cumulative_counts(idx: int, counts: np.ndarray) -> int:
+    """Find the index of the nearest value in `counts` that is <= idx. Assumes that
+    `counts` is monotonically increasing."""
+    return np.searchsorted(a=counts, v=idx, side="right") - 1
 
 
 @dataclass
@@ -83,7 +91,7 @@ class ParquetDataset(Dataset):
         return self.total_num_rows
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        total_idx = self.calculate_index_from_cumulative_counts(idx, self.cum_total_counts_np)
+        total_idx = _calculate_index_from_cumulative_counts(idx, self.cum_total_counts_np)
         group: RowGroupOffset = self.cum_total_counts[total_idx]
         return torch.tensor(
             self._get_single_row_with_row_group_batching(
@@ -175,6 +183,7 @@ class DateTimeSegment:
     start_idx: int
     end_idx: int
 
+
 class DatetimeParquetDataset(ParquetDataset):
     """Parquet dataset where each sample is a unique date+time with multiple rows (corresponding to
     multiple symbols). The samples will also include features+lags for the time_context_window
@@ -201,14 +210,15 @@ class DatetimeParquetDataset(ParquetDataset):
 
             # load the ith file and get just the date and time columns
             pq_df: pl.DataFrame = pl.read_parquet(file).select(["date_id", "time_id"])
+            dates: List[int] = pq_df.get_column("date_id").to_list()
+            times: List[int] = pq_df.get_column("time_id").to_list()
 
             # overall row where this file starts
             start_row = self.cum_row_counts[file_idx]
 
-            for row_idx in range(len(pq_df)):
-                date, time = pq_df.row(row_idx)
+            for row_idx, (date, time) in enumerate(zip(dates, times)):
 
-                if prev_date is None or prev_time is None or date != prev_date or time != prev_time:
+                if date != prev_date or time != prev_time:
                     # Create a segment at the start of the new date+time
                     segment = DateTimeSegment(
                         date=date,
@@ -227,10 +237,10 @@ class DatetimeParquetDataset(ParquetDataset):
         # get the start and end segments
         for i in range(len(self.date_time_segments) - 1):
             seg_1, seg_2 = self.date_time_segments[i], self.date_time_segments[i + 1]
-            start_idx = self.calculate_index_from_cumulative_counts(
+            start_idx = _calculate_index_from_cumulative_counts(
                 seg_1.start_offset, self.cum_total_counts_np
             )
-            end_idx = self.calculate_index_from_cumulative_counts(
+            end_idx = _calculate_index_from_cumulative_counts(
                 seg_2.start_offset - 1, self.cum_total_counts_np
             )
 
@@ -239,7 +249,7 @@ class DatetimeParquetDataset(ParquetDataset):
             seg_1.end_idx = end_idx
 
         final_segment = self.date_time_segments[-1]
-        final_segment.start_idx = self.calculate_index_from_cumulative_counts(
+        final_segment.start_idx = _calculate_index_from_cumulative_counts(
             final_segment.start_offset, self.cum_total_counts_np
         )
         final_segment.end_idx = len(self.cum_total_counts)
@@ -248,15 +258,32 @@ class DatetimeParquetDataset(ParquetDataset):
     def __len__(self) -> int:
         return len(self.date_time_segments)
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        return torch.stack(
-            [self._get_dt_sample(i) for i in range(max(0, idx - self.time_context_length), idx + 1)]
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        rows = self._get_dt_sample_range(
+            start_idx=max(0, idx - self.time_context_length),
+            end_idx=idx,
         )
 
-    def _get_dt_sample(self, idx: int) -> torch.Tensor:
-        seg = self.date_time_segments[idx]
+        # TODO Figure out how ot use the lagged responders properly since we don't necessarily have
+        # the same symbols from timestamp to timestamp.
+        return {
+            "date_id": rows[:, 0:1].int(),
+            "time_id": rows[:, 1:2].int(),
+            "symbol_id": rows[:, 2:3].int(),
+            "features": rows[:, 4:83],
+            "responders": rows[:, 83:92],
+        }
+
+    def _get_dt_sample_range(self, start_idx: int, end_idx: int) -> torch.Tensor:
+        start_segment, end_segment = (
+            self.date_time_segments[start_idx],
+            self.date_time_segments[end_idx],
+        )
+        start_idx = start_segment.start_idx
+        end_idx = end_segment.end_idx
+
         df_list: List[torch.Tensor] = []
-        for total_idx in range(seg.start_idx, seg.end_idx + 1):
+        for total_idx in range(start_idx, end_idx + 1):
             group: RowGroupOffset = self.cum_total_counts[total_idx]
             self._load_pq_file(
                 file_idx=group.file_idx,
@@ -266,19 +293,27 @@ class DatetimeParquetDataset(ParquetDataset):
             # start offset within this group is the total start offset minus the group start offset.
             # If it's greater than zero, we need to discard some rows from the start of this row
             # group.
-            start_offset = max(seg.start_offset - group.offset, 0)
+            start_offset = (
+                0 if total_idx != start_idx else start_segment.start_offset - group.offset
+            )
 
             # end offset within this group is the smaller of the total end row - the group start row
             # and the size of the group. Basically if the end offset is larger than row group, just
             # take the whole group. Otherwise we'll discard some rows from the end of this row
             # group.
-            end_offset = min(
-                seg.end_offset - group.offset,
-                self.file_row_group_counts[group.file_idx][group.row_group_idx],
+            end_offset = (
+                len(self.pq_cache.df)
+                if total_idx != end_idx
+                else end_segment.end_offset - group.offset
             )
 
             # The start row offset is ahead of the starting point for this row group.
             # Need to select the rows starting at the offset.
-            df_list.append(self.pq_cache.df.to_torch()[start_offset:end_offset])
+            row_df = self.pq_cache.df[start_offset:end_offset]
+
+            # Interestingly, it's 1.5-2x faster to do `to_numpy` and then `torch.from_numpy` than
+            # `to_torch` using polars. It's also faster to use `torch.Tensor.float()` than the
+            # `dtype` keyword in polars.
+            df_list.append(torch.from_numpy(row_df.to_numpy()).float())
 
         return torch.vstack(df_list)
