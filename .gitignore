@@ -165,3 +165,7 @@ cython_debug/
 data/
 notes.md
 .vscode
+
+# Scalene profiling outputs
+**/profile.html
+**/profile.json
