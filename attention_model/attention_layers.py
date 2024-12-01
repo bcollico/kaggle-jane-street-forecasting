@@ -370,7 +370,7 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
         )
         self.register_buffer(
             name="memory_norm",
-            tensor=torch.ones((self.d_head * n_head)),
+            tensor=torch.ones((self.d_head * n_head, 1)),
             persistent=True,
         )
 
@@ -398,9 +398,9 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
 
         # (n_b, n_seq, n_query,  n_head * d_head) @ (d_head * n_head, d_head * n_head) =
         # (n_b, n_seq, n_query * self.n_head, self.d_head)
-        return ((sigma_q @ self.memory) / (sigma_q @ self.memory_norm.view(-1, 1))).view(
-            n_b, n_seq, self.n_query * self.n_head, self.d_head
-        )
+        num = sigma_q @ self.memory
+        den = sigma_q @ self.memory_norm
+        return (num / den).view(n_b, n_seq, self.n_query * self.n_head, self.d_head)
 
     def update_memory(self, key: torch.Tensor, value: torch.Tensor) -> None:
         """Apply Equations 8, 9 from https://arxiv.org/pdf/2404.07143 to update the context memory
@@ -414,11 +414,11 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
         sigma_k_t = sigma_k.transpose(-2, -1)
 
         batch_update = sigma_k_t @ (
-            value - ((sigma_k @ self.memory) / (sigma_k @ self.memory_norm.view(-1, 1)))
+            value - ((sigma_k @ self.memory) / (sigma_k @ self.memory_norm))
         )
 
         self.memory += torch.sum(batch_update, dim=0)
-        self.memory_norm += torch.sum(sigma_k, dim=(0, 1))
+        self.memory_norm += torch.sum(sigma_k, dim=(0, 1)).unsqueeze(-1)
 
     def calculate_recurrent_attention(
         self, attention_out: torch.Tensor, attention_memory: torch.Tensor
