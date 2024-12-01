@@ -134,16 +134,41 @@ class TransformerModel(torch.nn.Module):
             in_features=n_responder_len, out_features=d_model
         )
 
+        # Create embeddings for all possible uint8 symbols, most of these will not be updated, but
+        # to make the model extensible to new symbols let's allocate for more than we need.
+        # Start embeddings at zero so that unseen embeddings have no contribution to the features.
+        self.symbol_embedding = torch.nn.Embedding.from_pretrained(
+            torch.zeros(256, d_model), freeze=False
+        )
+
+        # Relative date embedding. Assume that we'll have a small window of potential date ranges
+        # for an input sample. E.g. input dim of 8 means that we can only span up to 8 days in an
+        # input sequence. We assume that intra-day trends will be captured via this embedding and
+        # seasonal trends via a memory mechanism. Perhaps this will have to be expanded to better
+        # generalize to sequences across many more days than we have here.
+        self.date_embedding = torch.nn.Embedding.from_pretrained(
+            torch.zeros(8, d_model), freeze=False
+        )
+
+        # Absolute time embedding. The training dataset has <1000 absolute time indices. It's
+        # uncertain how I should be using these since the actual time between time_ids is not fixed,
+        # but we should use some form of absolute time embedding to capture inter-day trends.
+        self.time_embedding = torch.nn.Embedding.from_pretrained(
+            torch.zeros(1000, d_model), freeze=False
+        )
+
+        # Positional encoding var.
         self.rope = RotaryPositionalEncoding(d_model=d_model)
+
         self.out_norm = torch.nn.LayerNorm(d_model)
         self.logit_linear = torch.nn.Linear(in_features=d_model, out_features=n_output_bins)
         self.offset_linear = torch.nn.Linear(in_features=d_model, out_features=n_output_bins)
         self.softmax = torch.nn.Softmax(dim=-1)
 
-        # TODO rethink this cross attention situation -- since we're assuming that the responder at
+        # TODO rethink this cross attention situation -- if the responder at
         # t is paired with the feature at t+1, we could just so regular self-attention all the way
         # through. Could also see if there is benefit to interleaving cross attention with the
-        # lagged responders  and features throughout
+        # lagged responders and features throughout
         self.cross_attn_layer = TransformerBlock(
             n_head=n_head,
             n_query=n_query,
@@ -170,27 +195,94 @@ class TransformerModel(torch.nn.Module):
         self.cross_attn_mask: Optional[torch.Tensor] = None
         self.self_attn_mask: Optional[torch.Tensor] = None
 
-    def create_causal_mask(self, seq_len: int, device: torch.DeviceObjType) -> torch.Tensor:
-        """Get the self and cross attention masks for the input sequence length.
+    def create_causal_masks(self, id_mat: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get the self and cross attention masks for the input sequence length. return masks that
+        do not allow for attention from a token to a token in the same row position as well as
+        a mask that does.
+
+        E.g. id_mat = [1, 1, 2, 2, 2, 3]
+
+        self attention mask (attend to rows with same ID or lesser IDs)
+
+        output =    [1, 1, 1, 1, 1, 1]
+                    [1, 1, 1, 1, 1, 1]
+                    [0, 0, 1, 1, 1, 1]
+                    [0, 0, 1, 1, 1, 1]
+                    [0, 0, 1, 1, 1, 1]
+                    [0, 0, 0, 0, 0, 1]
+
+        cross attention mask (don't attend to rows with same ID.)
+
+        output =    [0, 0, 1, 1, 1, 1]
+                    [0, 0, 1, 1, 1, 1]
+                    [0, 0, 0, 0, 0, 1]
+                    [0, 0, 0, 0, 0, 1]
+                    [0, 0, 0, 0, 0, 1]
+                    [0, 0, 0, 0, 0, 0]
 
         Args:
-            seq_len (int) Length of the sequence to generate a mask for.
-            device (torch.DeviceObjType): Pytorch device object to allocate the masks on.
+            id_mat (torch.Tensor): Mask of ID values to use to create the mask. Items with the same
+                ID can attend to each other. Items can attend to values with smaller ID values.
+                (..., seq_len, 1)
+            diag (bool): Flag whether to allow attention between a query and value at the same row
+                index. Set to false for attention between features and responders at the same time
+                to avoid data leakage.
 
         Returns:
-            mask (torch.Tensor): Bool tensor with upper triangular set to True, including diagonal.
+            cross_attn_mask (torch.Tensor): Bool tensor with upper triangular set to True, excluding
+                diagonal. (..., seq_len, seq_len)
+            self_attn_mask (torch.Tensor): Bool tensor with upper triangular set to True, including
+                diagonal. (..., seq_len, seq_len)
         """
-        return torch.triu(torch.ones(seq_len, seq_len, dtype=bool, device=device), diagonal=1)
+        mat: torch.Tensor = id_mat == id_mat.transpose(-1, -2)
+        cumsum: torch.Tensor = torch.cumsum(mat, dim=-1)
+        return cumsum + torch.logical_not(mat) > mat.sum(dim=-2).unsqueeze(-1), cumsum.bool()
 
-    def forward(self, features: torch.Tensor, responders: torch.Tensor) -> torch.Tensor:
+    def create_date_and_time_masks(
+        self, date_id: torch.Tensor, time_id: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get the causal attention masks taking into account the date and time IDs.
+
+        Args:
+            time_id (torch.Tensor): Time IDs (..., seq_len, 1).
+            date_id (torch.Tensor): Date IDs (..., seq_len, 1).
+
+        Returns:
+            cross_attn_mask (torch.Tensor): Bool tensor with upper triangular set to True, excluding
+                diagonal. (..., seq_len, seq_len)
+            self_attn_mask (torch.Tensor): Bool tensor with upper triangular set to True, including
+                diagonal. (..., seq_len, seq_len)
+        """
+        ca_mask_t, sa_mask_t = self.create_causal_masks(id_mat=time_id)
+        ca_mask_d, sa_mask_d = self.create_causal_masks(id_mat=date_id)
+        return torch.logical_and(ca_mask_t, ca_mask_d), torch.logical_and(sa_mask_t, sa_mask_d)
+
+    def forward(
+        self,
+        date_ids: torch.Tensor,
+        time_ids: torch.Tensor,
+        symbol_ids: torch.Tensor,
+        features: torch.Tensor,
+        responders: torch.Tensor,
+    ) -> torch.Tensor:
         """Forward pass of the model. Treat responder regression as a classification problem to
         obtain an empirical distribution over the possible responder values, and then regress an
         offset from each bin center to the predicted value for each bin.
 
         Args:
+            date_ids (torch.Tensor): Integer values (batch_size, seq_len, 1) representing the
+                absolute date. Used for retrieving a relative time embedding with the time_id.
+            time_ids (torch.Tensor): Integer values batch_size, seq_len, 1)  representing the time
+                within a date. Used for retrieving a relative time embedding in combination with
+                the date_id.
+            symbol_ids (torch.Tensor): Integer values (batch_size, seq_len, 1) representing the
+                encrypted market ID of the time series. Used to retrieve a security-specific
+                embedding.
             features (torch.Tensor): Input features (batch_size, seq_len, n_feature_len)
             responders (torch.Tensor): Input lagged responders (batch_size, seq_len, n_responder_len)
-                where the feature vector `t` and responder vector `t-1` are paired.
+                where the feature vector `t` and responder vector `t` are paired. The responders
+                are masked in the forward pass so that the model doesn't get any "future"
+                information in the attention scores.
 
         Returns:
             responder_distribution (torch.Tensor): (batch_size, seq_len, n_output_bins) probability
@@ -198,24 +290,47 @@ class TransformerModel(torch.nn.Module):
             responder_offset (torch.Tensor): (batch_size, seq_len, n_output_bins) predicted offset
                 from the center of each bin to the predicted value within that bin.
         """
-        batch_size, seq_len, n_feature_len = features.shape
+        n_feature_len = features.shape[-1]
         n_responder_len = responders.shape[-1]
 
-        assert responders.shape[0] == batch_size
-        assert responders.shape[1] == seq_len
         assert n_responder_len == self.n_responder_len
         assert n_feature_len == self.n_feature_len
 
+        # Symbol and time embeddings use their absolute values.
+        symbol_emb = self.symbol_embedding(symbol_ids).squeeze(-2)
+        time_emb = self.time_embedding(time_ids).squeeze(-2)
+
+        # Date embedding uses a relative value to the start of this sequence since date is
+        # unbounded. TODO: try doing date_id % 365 so that it's bounded or (date_id % 365) % 12
+        # to get the long-term seasonal embeddings
+        relative_date_emb = self.date_embedding(
+            date_ids - torch.min(date_ids, dim=-2).values.unsqueeze(-2)
+        ).squeeze(-2)
+
+        # Create feature and responder embeddings.
         feature_emb = self.feature_embedding(features)
         responder_emb = self.responder_embedding(responders)
 
-        causal_mask = self.create_causal_mask(seq_len=seq_len, device=features.device)
-        out = self.cross_attn_layer.forward(x=responder_emb, y=feature_emb, mask=causal_mask)
+        # Augment feature embedding with time, date, and symbol embeddings.
+        feature_emb = feature_emb + time_emb + relative_date_emb + symbol_emb
 
+        # Create the masks for cross and self attention.
+        cross_attn_mask, self_attn_mask = self.create_date_and_time_masks(
+            date_id=date_ids, time_id=time_ids
+        )
+
+        # Cross attention between the features and their lagged responders.
+        out = self.cross_attn_layer.forward(
+            x=responder_emb, y=feature_emb, mask=cross_attn_mask.unsqueeze(1)
+        )
+
+        # Self attention layers.
         for layer in self.layers:
-            out = layer.forward(x=out, mask=causal_mask)
+            out = layer.forward(x=out, mask=self_attn_mask.unsqueeze(1))
 
         out_norm = self.out_norm(out)
+
+        # Predict a discrete distribution over the responder variables.
         responder_distribution = self.softmax(self.logit_linear(out_norm))
         responder_offset = self.offset_linear(out_norm)
 

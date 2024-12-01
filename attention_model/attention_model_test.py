@@ -26,7 +26,7 @@ class ModelTestFixture(unittest.TestCase):
         )
 
         batch_size = 10
-        seq_len = 20
+        seq_len = 64
         x = torch.randn(batch_size, seq_len, self.d_model)
 
         block.forward(x=x)
@@ -46,9 +46,18 @@ class ModelTestFixture(unittest.TestCase):
             n_responder_len=n_responder_len,
         )
 
-        batch_size = 10
-        seq_len = 20
+        batch_size = 2
+        seq_len = 64
         features = torch.randn(batch_size, seq_len, n_feature_len)
         responders = torch.randn(batch_size, seq_len, n_responder_len)
+        symbol_ids = torch.randint(0, 255, (batch_size, seq_len, 1))
+        time_ids = torch.randint(0, 1000, (batch_size, seq_len, 1))
+        date_ids = torch.randint(0, 8, (batch_size, seq_len, 1))
 
-        model.forward(features=features, responders=responders)
+        model.forward(
+            features=features,
+            responders=responders,
+            time_ids=time_ids,
+            date_ids=date_ids,
+            symbol_ids=symbol_ids,
+        )

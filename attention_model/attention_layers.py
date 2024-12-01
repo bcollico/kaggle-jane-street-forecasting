@@ -205,7 +205,8 @@ class GroupedQueryAttention(torch.nn.Module):
                 d_model = n_query * n_head * d_head
             key (torch.Tensor): attention key matrix of shape (n_b, n_seq, d_head * n_head).
             value (torch.Tensor): attention value matrix of shape (n_b, n_seq, d_head * n_head).
-            mask (torch.Tensor | None) Optional mask of shape (n_seq, n_seq) for casual attention.
+            mask (torch.Tensor | None) Optional mask of shape (batch_size, 1, n_seq, n_seq) for
+                casual attention.
 
         Returns:
             attention_output (torch.Tensor): Attention output of shape
@@ -258,7 +259,8 @@ class GroupedQueryAttention(torch.nn.Module):
                 and y to compute the keys and values.
             return_qkv (bool): Return the query, key, and value matrices (in that order) in addition
                 to the the attention output
-            mask (torch.Tensor | None) Optional mask of shape (n_seq, n_seq) for casual attention.
+            mask (torch.Tensor | None) Optional mask of shape (batch_size, 1, n_seq, n_seq) for
+                casual attention.
         Output:
             attention_output (torch.Tensor): Attention output of shape
                 (n_b, n_seq, n_query * n_head, d_head)
@@ -300,7 +302,8 @@ class GroupedQueryAttention(torch.nn.Module):
             y (torch.Tensor): Optional batched tensor of shape (n_b, n_seq, d_model), if present,
                 the layer calculates cross-attention between x and y by using x to compute the query
                 and y to compute the keys and values.
-            mask (torch.Tensor | None) Optional mask of shape (n_seq, n_seq) for casual attention.
+            mask (torch.Tensor | None) Optional mask of shape (batch_size, 1, n_seq, n_seq) for
+                casual attention.
         Returns:
             (torch.Tensor): Batched tensor of shape (n_b, n_seq, d_model)
         """
@@ -439,7 +442,7 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
             y (torch.Tensor): Optional batched tensor of shape (n_b, n_seq, d_model), if present,
                 the layer calculates cross-attention between x and y by using x to compute the query
                 and y to compute the keys and values.
-            mask (torch.Tensor | None) Optional mask of shape (n_seq, n_seq) for casual attention.
+            mask (torch.Tensor | None) Optional mask of shape (batch_size, 1, n_seq, n_seq) for casual attention.
 
         Returns:
             (torch.Tensor): Batched tensor of shape (n_b, n_seq, d_model)
