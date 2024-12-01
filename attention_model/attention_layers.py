@@ -363,8 +363,16 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
 
         # Memory parameters. Keep a feature-length memory matrix and normalization vector for each
         # head.
-        self.memory = torch.zeros((self.d_head * n_head, self.d_head * n_head))
-        self.memory_norm = torch.ones((self.d_head * n_head))
+        self.register_buffer(
+            name="memory",
+            tensor=torch.zeros((self.d_head * n_head, self.d_head * n_head)),
+            persistent=True,
+        )
+        self.register_buffer(
+            name="memory_norm",
+            tensor=torch.ones((self.d_head * n_head)),
+            persistent=True,
+        )
 
         # Scalar parameter for mixing the attention scores from the current forward pass with the
         # memory context.

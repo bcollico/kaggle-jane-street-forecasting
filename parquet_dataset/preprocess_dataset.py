@@ -116,7 +116,9 @@ def process_parquets():
     # print(dataset.files)
 
     symbols = pl.from_arrow(dataset.read(["symbol_id"])).get_column("symbol_id").unique().to_list()
-
+    time = pl.from_arrow(dataset.read(["time_id"])).get_column("time_id").unique().to_list()
+    print(time)
+    return
     # print(symbols)
     # print_ram()
 

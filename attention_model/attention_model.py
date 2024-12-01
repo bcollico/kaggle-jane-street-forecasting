@@ -1,9 +1,10 @@
 """Transformer block and full model definitions"""
 
 from typing import Optional, Tuple
+from copy import deepcopy
 import torch
 from attention_model.attention_layers import (
-    GroupedQueryAttention,
+    InfiniGroupedQueryAttention,
     RotaryPositionalEncoding,
     SwiGLUFeedForward,
 )
@@ -43,7 +44,7 @@ class TransformerBlock(torch.nn.Module):
         self.norm1 = torch.nn.LayerNorm(normalized_shape=d_model)
         self.norm2 = torch.nn.LayerNorm(normalized_shape=d_model)
 
-        self.attention = GroupedQueryAttention(
+        self.attention = InfiniGroupedQueryAttention(
             d_model=d_model, n_head=n_head, n_query=n_query, dropout_pct=dropout_pct, rope=rope
         )
 
@@ -69,7 +70,7 @@ class TransformerBlock(torch.nn.Module):
         """
         x = x + self.attention.forward(
             self.norm1(x), self.norm1(y) if y is not None else y, mask=mask
-        )
+        ).nan_to_num(0.0)
         return x + self.feedforward.forward(self.norm2(x))
 
 
@@ -99,7 +100,7 @@ class TransformerModel(torch.nn.Module):
         n_head: int,
         n_query: int,
         n_ff_expansion: int = 4,
-        dropout_pct: float = 0.4,
+        dropout_pct: float = 0.3,
         swish_beta: float = 1.0,
     ) -> None:
         """
@@ -161,8 +162,12 @@ class TransformerModel(torch.nn.Module):
         self.rope = RotaryPositionalEncoding(d_model=d_model)
 
         self.out_norm = torch.nn.LayerNorm(d_model)
-        self.logit_linear = torch.nn.Linear(in_features=d_model, out_features=n_output_bins)
-        self.offset_linear = torch.nn.Linear(in_features=d_model, out_features=n_output_bins)
+        self.logit_linear = torch.nn.Linear(
+            in_features=d_model, out_features=n_responder_len * n_output_bins
+        )
+        self.offset_linear = torch.nn.Linear(
+            in_features=d_model, out_features=n_responder_len * n_output_bins
+        )
         self.softmax = torch.nn.Softmax(dim=-1)
 
         # TODO rethink this cross attention situation -- if the responder at
@@ -179,30 +184,30 @@ class TransformerModel(torch.nn.Module):
             dropout_pct=dropout_pct,
         )
 
-        self.layers = [
-            TransformerBlock(
-                n_head=n_head,
-                n_query=n_query,
-                d_model=d_model,
-                rope=self.rope,
-                n_ff_expansion=n_ff_expansion,
-                swish_beta=swish_beta,
-                dropout_pct=dropout_pct,
-            )
-            for _ in range(n_blocks)
-        ]
+        self.layers = torch.nn.ModuleList(
+            [
+                deepcopy(TransformerBlock(
+                    n_head=n_head,
+                    n_query=n_query,
+                    d_model=d_model,
+                    rope=self.rope,
+                    n_ff_expansion=n_ff_expansion,
+                    swish_beta=swish_beta,
+                    dropout_pct=dropout_pct,
+                ))
+                for _ in range(n_blocks)
+            ]
+        )
 
-        self.cross_attn_mask: Optional[torch.Tensor] = None
-        self.self_attn_mask: Optional[torch.Tensor] = None
-
-    def create_causal_masks(self, id_mat: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    @staticmethod
+    def create_causal_masks(id_mat: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get the self and cross attention masks for the input sequence length. return masks that
         do not allow for attention from a token to a token in the same row position as well as
         a mask that does.
 
         E.g. id_mat = [1, 1, 2, 2, 2, 3]
 
-        self attention mask (attend to rows with same ID or lesser IDs)
+        cross attention mask (don't attend to rows with same ID.)
 
         output =    [1, 1, 1, 1, 1, 1]
                     [1, 1, 1, 1, 1, 1]
@@ -211,7 +216,7 @@ class TransformerModel(torch.nn.Module):
                     [0, 0, 1, 1, 1, 1]
                     [0, 0, 0, 0, 0, 1]
 
-        cross attention mask (don't attend to rows with same ID.)
+        self attention mask (attend to rows with same ID or lesser IDs)
 
         output =    [0, 0, 1, 1, 1, 1]
                     [0, 0, 1, 1, 1, 1]
@@ -229,9 +234,9 @@ class TransformerModel(torch.nn.Module):
                 to avoid data leakage.
 
         Returns:
-            cross_attn_mask (torch.Tensor): Bool tensor with upper triangular set to True, excluding
-                diagonal. (..., seq_len, seq_len)
             self_attn_mask (torch.Tensor): Bool tensor with upper triangular set to True, including
+                diagonal. (..., seq_len, seq_len)
+            cross_attn_mask (torch.Tensor): Bool tensor with upper triangular set to True, excluding
                 diagonal. (..., seq_len, seq_len)
         """
         mat: torch.Tensor = id_mat == id_mat.transpose(-1, -2)
@@ -248,14 +253,18 @@ class TransformerModel(torch.nn.Module):
             date_id (torch.Tensor): Date IDs (..., seq_len, 1).
 
         Returns:
-            cross_attn_mask (torch.Tensor): Bool tensor with upper triangular set to True, excluding
-                diagonal. (..., seq_len, seq_len)
             self_attn_mask (torch.Tensor): Bool tensor with upper triangular set to True, including
                 diagonal. (..., seq_len, seq_len)
+            cross_attn_mask (torch.Tensor): Bool tensor with upper triangular set to True, excluding
+                diagonal. (..., seq_len, seq_len)
         """
-        ca_mask_t, sa_mask_t = self.create_causal_masks(id_mat=time_id)
-        ca_mask_d, sa_mask_d = self.create_causal_masks(id_mat=date_id)
-        return torch.logical_and(ca_mask_t, ca_mask_d), torch.logical_and(sa_mask_t, sa_mask_d)
+        sa_mask_t, ca_mask_t = self.create_causal_masks(id_mat=time_id)
+        # sa_mask_d, ca_mask_d = self.create_causal_masks(id_mat=date_id)
+        # TODO figure out if/how to mask on date + time and not just time. Assuming currently that
+        # it might be sufficient to mask on time alone when the window is small enough since the
+        # time id will wrap around from a large number to a small number when the sequence is
+        # split across days.
+        return sa_mask_t, ca_mask_t
 
     def forward(
         self,
@@ -290,6 +299,7 @@ class TransformerModel(torch.nn.Module):
             responder_offset (torch.Tensor): (batch_size, seq_len, n_output_bins) predicted offset
                 from the center of each bin to the predicted value within that bin.
         """
+        batch_size, seq_len = features.shape[:2]
         n_feature_len = features.shape[-1]
         n_responder_len = responders.shape[-1]
 
@@ -315,11 +325,13 @@ class TransformerModel(torch.nn.Module):
         feature_emb = feature_emb + time_emb + relative_date_emb + symbol_emb
 
         # Create the masks for cross and self attention.
-        cross_attn_mask, self_attn_mask = self.create_date_and_time_masks(
+        self_attn_mask, cross_attn_mask = self.create_date_and_time_masks(
             date_id=date_ids, time_id=time_ids
         )
 
         # Cross attention between the features and their lagged responders.
+        # TODO: Fix masked attention here to avoid NaN on first sample. Currently we just replace
+        # fill the nans with 0.0 in the attention layer to pass the features through inplace of nan.
         out = self.cross_attn_layer.forward(
             x=responder_emb, y=feature_emb, mask=cross_attn_mask.unsqueeze(1)
         )
@@ -331,7 +343,11 @@ class TransformerModel(torch.nn.Module):
         out_norm = self.out_norm(out)
 
         # Predict a discrete distribution over the responder variables.
-        responder_distribution = self.softmax(self.logit_linear(out_norm))
-        responder_offset = self.offset_linear(out_norm)
+        responder_distribution = self.softmax(
+            self.logit_linear(out_norm).view(batch_size, seq_len, n_responder_len, -1)
+        )
+        responder_offset = self.offset_linear(out_norm).reshape(
+            batch_size, seq_len, n_responder_len, -1
+        )
 
         return responder_distribution, responder_offset
