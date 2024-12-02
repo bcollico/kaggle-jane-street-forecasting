@@ -82,7 +82,7 @@ class RotaryPositionalEncoding(torch.nn.Module):
 
         # Stack the new values in the sin/cos caches.
         self.sin_pos = torch.vstack((self.sin_pos, torch.sin(angles)))
-        self.cos_pos = torch.vstack((self.cos_pos, torch.sin(angles)))
+        self.cos_pos = torch.vstack((self.cos_pos, torch.cos(angles)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Applies the positional encoding to the input tensor. Updates the
@@ -236,12 +236,23 @@ class GroupedQueryAttention(torch.nn.Module):
 
         # (n_b, n_query * n_head, n_seq, n_seq)
         attention_scores = query_t @ key_t * self.attention_scale
+
         if mask is not None:
-            attention_scores = torch.masked_fill(attention_scores, mask, value=float("-inf"))
+            attention_scores = torch.masked_fill(attention_scores, mask, value=-1e9)
         attention_probabilities = torch.nn.functional.softmax(attention_scores, dim=-1)
+
+        # TODO: Fix masked attention here to avoid NaN on first sample. Currently we just replace
+        # fill the nans with 0.0 in the attention layer to pass the features through inplace of nan.
+        attention_probabilities = torch.masked_fill(attention_probabilities, mask, value=0.0)
 
         # (n_b, n_query * n_head, n_seq, d_head) -> (n_b, n_seq, n_query * n_head, d_head)
         return (self.attn_dropout(attention_probabilities) @ value_t).transpose(1, 2)
+
+    def kqv(
+        self, k: torch.Tensor, q: torch.Tensor, v: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Calculate key query value projections"""
+        return self.key_proj(k), self.query_proj(q), self.value_proj(v)
 
     def calculate_attention_output(
         self,
@@ -266,16 +277,11 @@ class GroupedQueryAttention(torch.nn.Module):
                 (n_b, n_seq, n_query * n_head, d_head)
 
         """
-        y = x if y is None else y
 
-        # (n_b, n_seq, d_model) @ (d_model, d_head * n_head) = (n_b, n_seq, d_head * n_head)
-        key = self.key_proj(y)
-
-        # (n_b, n_seq, d_model) @ (d_model, d_head * n_head) = (n_b, n_seq, d_head * n_head)
-        value = self.value_proj(y)
-
-        # (n_b, n_seq, d_model) @ (d_model, d_model) = (n_b, n_seq, d_model)
-        query = self.query_proj(x)
+        if y is not None:
+            key, query, value = self.kqv(q=x, k=y, v=y)
+        else:
+            key, query, value = self.kqv(q=x, k=x, v=x)
 
         attention_output = self.scaled_dot_product_attention(
             query=self.positional_encoding.forward(query),
@@ -376,7 +382,9 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
 
         # Scalar parameter for mixing the attention scores from the current forward pass with the
         # memory context.
-        self.memory_weight = torch.nn.Parameter(data=torch.Tensor([1.0]), requires_grad=True)
+        self.memory_weight = torch.nn.Parameter(
+            data=torch.ones(self.n_head * self.n_query), requires_grad=True
+        )
 
     def calculate_memory_attention(self, query: torch.Tensor) -> torch.Tensor:
         """Computes Equation 7 from https://arxiv.org/pdf/2404.07143 to get the memory component
@@ -398,9 +406,11 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
 
         # (n_b, n_seq, n_query,  n_head * d_head) @ (d_head * n_head, d_head * n_head) =
         # (n_b, n_seq, n_query * self.n_head, self.d_head)
-        num = sigma_q @ self.memory
-        den = sigma_q @ self.memory_norm
-        return (num / den).view(n_b, n_seq, self.n_query * self.n_head, self.d_head)
+        # Use torch.clone here since we modify self.memory and self.memory_norm in-place during
+        # the forward pass, which breaks the backward pass during training.
+        num = sigma_q @ self.memory.clone()
+        den = sigma_q @ self.memory_norm.clone()
+        return torch.div(num, den + 1e-8).view(n_b, n_seq, self.n_query * self.n_head, self.d_head)
 
     def update_memory(self, key: torch.Tensor, value: torch.Tensor) -> None:
         """Apply Equations 8, 9 from https://arxiv.org/pdf/2404.07143 to update the context memory
@@ -413,8 +423,10 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
         sigma_k = self.mem_activation(key)
         sigma_k_t = sigma_k.transpose(-2, -1)
 
+        # NOTE: Same issue with updating self.memory(_norm) here. Updating during the forward pass
+        # break backprop. Need to update this to delay the update until after we do backward().
         batch_update = sigma_k_t @ (
-            value - ((sigma_k @ self.memory) / (sigma_k @ self.memory_norm))
+            value - torch.div(sigma_k @ self.memory.clone(), sigma_k @ self.memory_norm.clone())
         )
 
         self.memory += torch.sum(batch_update, dim=0)
@@ -435,7 +447,7 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
             (torch.Tensor): local and context attention fused output
                 (n_b, n_seq, n_query * n_head,  d_head).
         """
-        mem_weight = torch.nn.functional.sigmoid(self.memory_weight)
+        mem_weight = torch.nn.functional.sigmoid(self.memory_weight).view(1, 1, -1, 1)
         return attention_out * (1.0 - mem_weight) + attention_memory * mem_weight
 
     def forward(
@@ -464,10 +476,10 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
         )
 
         # (n_b, n_seq, n_query * n_head, d_head)
-        attention_memory = self.calculate_memory_attention(query=query)
+        attention_memory = self.calculate_memory_attention(query=query.clone())
 
         # Update the memory matrix and normalization term in-place.
-        self.update_memory(key=key, value=value)
+        self.update_memory(key=key.clone(), value=value.clone())
 
         # (n_b, n_seq, n_query * n_head, d_head) -> ((n_b, n_seq, d_model))
         return self.attn_proj(

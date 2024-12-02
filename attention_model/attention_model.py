@@ -68,9 +68,10 @@ class TransformerBlock(torch.nn.Module):
         Returns:
             output (torch.Tensor):
         """
-        x = x + self.attention.forward(
-            self.norm1(x), self.norm1(y) if y is not None else y, mask=mask
-        ).nan_to_num(0.0)
+        if y is not None:
+            x = x + self.attention.forward(self.norm1(x), self.norm1(y), mask=mask)
+        else:
+            x = x + self.attention.forward(self.norm1(x), None, mask=mask)
         return x + self.feedforward.forward(self.norm2(x))
 
 
@@ -186,15 +187,17 @@ class TransformerModel(torch.nn.Module):
 
         self.layers = torch.nn.ModuleList(
             [
-                deepcopy(TransformerBlock(
-                    n_head=n_head,
-                    n_query=n_query,
-                    d_model=d_model,
-                    rope=self.rope,
-                    n_ff_expansion=n_ff_expansion,
-                    swish_beta=swish_beta,
-                    dropout_pct=dropout_pct,
-                ))
+                deepcopy(
+                    TransformerBlock(
+                        n_head=n_head,
+                        n_query=n_query,
+                        d_model=d_model,
+                        rope=self.rope,
+                        n_ff_expansion=n_ff_expansion,
+                        swish_beta=swish_beta,
+                        dropout_pct=dropout_pct,
+                    )
+                )
                 for _ in range(n_blocks)
             ]
         )
@@ -330,8 +333,6 @@ class TransformerModel(torch.nn.Module):
         )
 
         # Cross attention between the features and their lagged responders.
-        # TODO: Fix masked attention here to avoid NaN on first sample. Currently we just replace
-        # fill the nans with 0.0 in the attention layer to pass the features through inplace of nan.
         out = self.cross_attn_layer.forward(
             x=responder_emb, y=feature_emb, mask=cross_attn_mask.unsqueeze(1)
         )

@@ -46,7 +46,7 @@ class ModelTestFixture(unittest.TestCase):
             n_responder_len=n_responder_len,
         )
 
-        batch_size = 2
+        batch_size = 2  
         seq_len = 64
         features = torch.randn(batch_size, seq_len, n_feature_len)
         responders = torch.randn(batch_size, seq_len, n_responder_len)
