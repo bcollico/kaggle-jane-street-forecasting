@@ -32,14 +32,14 @@ def create_model() -> TransformerModel:
         n_blocks=1,
         n_feature_len=79,
         n_responder_len=9,
-        n_query=8,
+        n_query=4,
         n_head=4,
         n_output_bins=101,
         d_model=1024,
     )
 
 
-def create_optimizer(model: torch.nn.Module, lr: float = 0.001) -> torch.optim.Optimizer:
+def create_optimizer(model: torch.nn.Module, lr: float = 0.0001) -> torch.optim.Optimizer:
     return torch.optim.AdamW(
         params=model.parameters(),
         lr=lr,
@@ -50,11 +50,11 @@ def get_num_params(model: torch.nn.Module) -> int:
     return sum(p.shape.numel() for p in model.parameters() if p.requires_grad)
 
 
-def train(num_epochs: int = 20, train_seq_len: int = 8) -> None:
+def train(num_epochs: int = 10, train_seq_len: int = 8) -> None:
     """Train a model."""
     dataloader = create_dataloader(
-        parquet_files=[make_train_parquet_path(i) for i in range(1)],
-        window_size=128,
+        parquet_files=[make_train_parquet_path(i) for i in range(9)],
+        window_size=64,
         batch_size=1,
         # num_workers=6,
         shuffle=False,
@@ -68,7 +68,7 @@ def train(num_epochs: int = 20, train_seq_len: int = 8) -> None:
 
     print(f"Created model with {get_num_params(model)} parameters.")
 
-    nll_loss = torch.nn.NLLLoss()
+    # nll_loss = torch.nn.NLLLoss()
     # l2_loss = torch.nn.SmoothL1Loss()
 
     for epoch in range(0, num_epochs):
@@ -87,23 +87,26 @@ def train(num_epochs: int = 20, train_seq_len: int = 8) -> None:
                 responders=responders,
             )
 
-            targets = (100 * ((responders + 5.0) / 10.0)).long()
-            num_samples += targets.shape[1]
+            # targets = (100 * ((responders + 5.0) / 10.0)).long()
+            num_samples += responders.shape[1]
 
-            loss += nll_loss.forward(
-                input=pred_probs.permute(0, 3, 1, 2).contiguous(), target=targets
-            )
+            loss += torch.nn.functional.smooth_l1_loss(pred_probs, responders)
+            # loss += nll_loss.forward(
+            #     input=pred_probs.permute(0, 3, 1, 2).contiguous(), target=targets
+            # )
 
             if (i + 1) % train_seq_len == 0:
+                print(loss.item() / train_seq_len, num_samples)
                 loss.backward()
                 optim.step()
                 optim.zero_grad()
                 model.reset_memory()
-                print(loss.item() / num_samples, num_samples)
                 num_samples = 0
                 loss = loss.zero_().detach()
-                print(f"backpropped {i/train_seq_len}")
-                break  # overfit to first sequence
+
+    import pdb
+
+    pdb.set_trace()
 
 
 if __name__ == "__main__":

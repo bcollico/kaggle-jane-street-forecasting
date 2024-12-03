@@ -259,11 +259,11 @@ class DatetimeParquetDataset(ParquetDataset):
         return len(self.date_time_segments) // self.time_context_length
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        idx = min(len(self) * self.time_context_length, idx * self.time_context_length + self.time_context_length)
-        print(idx)
+        idx = idx * self.time_context_length + self.time_context_length
+
         rows = self._get_dt_sample_range(
             start_idx=max(0, idx - self.time_context_length),
-            end_idx=idx,
+            end_idx=min(len(self.date_time_segments) - 1, idx),
         )
 
         # TODO Figure out how ot use the lagged responders properly since we don't necessarily have

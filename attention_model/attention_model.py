@@ -163,9 +163,7 @@ class TransformerModel(torch.nn.Module):
         self.rope = RotaryPositionalEncoding(d_model=d_model)
 
         self.out_norm = torch.nn.LayerNorm(d_model)
-        self.logit_linear = torch.nn.Linear(
-            in_features=d_model, out_features=n_responder_len * n_output_bins
-        )
+        self.logit_linear = torch.nn.Linear(in_features=d_model, out_features=n_responder_len)
         self.offset_linear = torch.nn.Linear(
             in_features=d_model, out_features=n_responder_len * n_output_bins
         )
@@ -349,9 +347,7 @@ class TransformerModel(torch.nn.Module):
         out_norm = self.out_norm(out)
 
         # Predict a discrete distribution over the responder variables.
-        responder_distribution = self.softmax(
-            self.logit_linear(out_norm).view(batch_size, seq_len, n_responder_len, -1)
-        )
+        responder_distribution = self.logit_linear(out_norm)
         responder_offset = self.offset_linear(out_norm).reshape(
             batch_size, seq_len, n_responder_len, -1
         )
