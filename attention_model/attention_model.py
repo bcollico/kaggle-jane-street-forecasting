@@ -202,6 +202,11 @@ class TransformerModel(torch.nn.Module):
             ]
         )
 
+    def reset_memory(self):
+        self.cross_attn_layer.attention.reset_memory()
+        for layer in self.layers:
+            layer.attention.reset_memory()
+
     @staticmethod
     def create_causal_masks(id_mat: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get the self and cross attention masks for the input sequence length. return masks that

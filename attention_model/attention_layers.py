@@ -6,6 +6,7 @@ Grouped-Query Attention based on: https://arxiv.org/pdf/2305.13245
 
 from typing import Optional, Tuple
 import torch
+from torch.utils.checkpoint import checkpoint
 
 
 class SwiGLUFeedForward(torch.nn.Module):
@@ -386,7 +387,9 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
             data=torch.ones(self.n_head * self.n_query), requires_grad=True
         )
 
-    def calculate_memory_attention(self, query: torch.Tensor) -> torch.Tensor:
+    def calculate_memory_attention(
+        self, query: torch.Tensor, memory: torch.Tensor, memory_norm: torch.Tensor
+    ) -> torch.Tensor:
         """Computes Equation 7 from https://arxiv.org/pdf/2404.07143 to get the memory component
         of the attention layer, `A_mem`.
 
@@ -408,11 +411,17 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
         # (n_b, n_seq, n_query * self.n_head, self.d_head)
         # Use torch.clone here since we modify self.memory and self.memory_norm in-place during
         # the forward pass, which breaks the backward pass during training.
-        num = sigma_q @ self.memory.clone()
-        den = sigma_q @ self.memory_norm.clone()
+        num = sigma_q @ memory
+        den = sigma_q @ memory_norm
         return torch.div(num, den + 1e-8).view(n_b, n_seq, self.n_query * self.n_head, self.d_head)
 
-    def update_memory(self, key: torch.Tensor, value: torch.Tensor) -> None:
+    def update_memory(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        memory: torch.Tensor,
+        memory_norm: torch.Tensor,
+    ) -> None:
         """Apply Equations 8, 9 from https://arxiv.org/pdf/2404.07143 to update the context memory
         of the attention layer.
 
@@ -425,12 +434,17 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
 
         # NOTE: Same issue with updating self.memory(_norm) here. Updating during the forward pass
         # break backprop. Need to update this to delay the update until after we do backward().
-        batch_update = sigma_k_t @ (
-            value - torch.div(sigma_k @ self.memory.clone(), sigma_k @ self.memory_norm.clone())
-        )
+        batch_update = sigma_k_t @ (value - torch.div(sigma_k @ memory, sigma_k @ memory_norm))
 
         self.memory += torch.sum(batch_update, dim=0)
         self.memory_norm += torch.sum(sigma_k, dim=(0, 1)).unsqueeze(-1)
+
+    def reset_memory(self) -> None:
+        self.memory.zero_()
+        self.memory_norm.fill_(1.0)
+
+        self.memory = self.memory.detach()
+        self.memory_norm = self.memory_norm.detach()
 
     def calculate_recurrent_attention(
         self, attention_out: torch.Tensor, attention_memory: torch.Tensor
@@ -468,22 +482,34 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
             (torch.Tensor): Batched tensor of shape (n_b, n_seq, d_model)
         """
 
-        n_b, n_seq, d_model = x.shape
+        def ckpt_fwd(
+            x: torch.Tensor,
+            memory: torch.Tensor,
+            memory_norm: torch.Tensor,
+            y: Optional[torch.Tensor] = None,
+            mask: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
 
-        # (n_b, n_seq, n_query * n_head, d_head)
-        attention_out, query, key, value = self.calculate_attention_output(
-            x=x, y=y, return_qkv=True, mask=mask
-        )
+            n_b, n_seq, d_model = x.shape
 
-        # (n_b, n_seq, n_query * n_head, d_head)
-        attention_memory = self.calculate_memory_attention(query=query.clone())
+            # (n_b, n_seq, n_query * n_head, d_head)
+            attention_out, query, key, value = self.calculate_attention_output(
+                x=x, y=y, return_qkv=True, mask=mask
+            )
 
-        # Update the memory matrix and normalization term in-place.
-        self.update_memory(key=key.clone(), value=value.clone())
+            # (n_b, n_seq, n_query * n_head, d_head)
+            attention_memory = self.calculate_memory_attention(
+                query=query, memory=memory, memory_norm=memory_norm
+            )
 
-        # (n_b, n_seq, n_query * n_head, d_head) -> ((n_b, n_seq, d_model))
-        return self.attn_proj(
-            self.calculate_recurrent_attention(
-                attention_out=attention_out, attention_memory=attention_memory
-            ).reshape(n_b, n_seq, d_model)
-        )
+            # Update the memory matrix and normalization term in-place.
+            self.update_memory(key=key, value=value, memory=memory, memory_norm=memory_norm)
+
+            # (n_b, n_seq, n_query * n_head, d_head) -> ((n_b, n_seq, d_model))
+            return self.attn_proj(
+                self.calculate_recurrent_attention(
+                    attention_out=attention_out, attention_memory=attention_memory
+                ).reshape(n_b, n_seq, d_model)
+            )
+
+        return checkpoint(ckpt_fwd, x, self.memory.clone(), self.memory_norm.clone(), y, mask, use_reentrant=False)
