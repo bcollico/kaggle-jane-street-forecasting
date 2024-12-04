@@ -1,8 +1,5 @@
 from typing import List
 
-import torch
-from torch.utils.data import DataLoader
-
 import os
 import sys
 import inspect
@@ -11,103 +8,150 @@ currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentfram
 parentdir = os.path.dirname(currentdir)
 sys.path.insert(0, parentdir)
 
+import torch
+from torch.utils.data import DataLoader
+from torchsummary import summary
+
 from attention_model.attention_model import TransformerModel
 from parquet_dataset.parquet_dataset import DatetimeParquetDataset
 
+K_TRAIN_INDICES = [0]  # , 1, 2, 3, 4, 5, 6, 7, 8]
+K_VAL_INDICES = [9]
 
-def make_train_parquet_path(i: int) -> str:
+
+def make_parquet_path(i: int) -> str:
     """Create a string path to a parquet file."""
-    return f"/kaggle/input/jane-street-real-time-market-data-forecasting/train.parquet/partition_id={i}/part-0.parquet"
-
-
-def create_dataloader(parquet_files: List[str], window_size: int, **kwargs) -> DataLoader:
-    """Create the parquet dataloader. Pass DataLoader options as kwargs."""
-    dataset = DatetimeParquetDataset(file_paths=parquet_files, time_context_length=window_size)
-    return DataLoader(dataset=dataset, **kwargs)
-
-
-def create_model() -> TransformerModel:
-    """Create the model."""
-    return TransformerModel(
-        n_blocks=1,
-        n_feature_len=79,
-        n_responder_len=9,
-        n_query=4,
-        n_head=4,
-        n_output_bins=101,
-        d_model=1024,
+    return (
+        f"/kaggle/input/jane-street-real-time-market-data-forecasting/train.parquet/"
+        f"partition_id={i}/part-0.parquet"
     )
 
 
-def create_optimizer(model: torch.nn.Module, lr: float = 0.0001) -> torch.optim.Optimizer:
-    return torch.optim.AdamW(
-        params=model.parameters(),
-        lr=lr,
-    )
+class ModelRunner:
+    """Model running class for training."""
 
+    def __init__(self, num_epochs: int = 10, train_seq_len: int = 32) -> None:
 
-def get_num_params(model: torch.nn.Module) -> int:
-    return sum(p.shape.numel() for p in model.parameters() if p.requires_grad)
+        self.num_epochs = num_epochs
+        self.train_seq_len = train_seq_len
 
+        self.train_dataloader: DataLoader = self.create_dataloader(
+            parquet_files=[make_parquet_path(i) for i in K_TRAIN_INDICES],
+            window_size=64,
+            batch_size=1,
+            shuffle=False,
+        )
 
-def train(num_epochs: int = 10, train_seq_len: int = 8) -> None:
-    """Train a model."""
-    dataloader = create_dataloader(
-        parquet_files=[make_train_parquet_path(i) for i in range(9)],
-        window_size=64,
-        batch_size=1,
-        # num_workers=6,
-        shuffle=False,
-        # prefetch_factor=6,
-    )
+        self.log_dataloader_info(self.train_dataloader, mode="train")
 
-    print(f"Created dataloader with {len(dataloader)} samples")
+        self.val_dataloader = self.create_dataloader(
+            parquet_files=[make_parquet_path(i) for i in K_VAL_INDICES],
+            window_size=64,
+            batch_size=1,
+            shuffle=False,
+        )
 
-    model = create_model().cuda()
-    optim = create_optimizer(model=model)
+        self.log_dataloader_info(self.val_dataloader, mode="val")
 
-    print(f"Created model with {get_num_params(model)} parameters.")
+        self.model = self.create_model()
+        print(f"Created model with {self.get_num_params()} parameters")
+        summary(
+            self.model,
+            input_size=[(1, 6000, 1), (1, 6000, 1), (1, 6000, 1), (1, 6000, 79), (1, 6000, 9)],
+            dtypes=[torch.int64, torch.int64, torch.int64, torch.float32, torch.float32],
+        )
 
-    # nll_loss = torch.nn.NLLLoss()
-    # l2_loss = torch.nn.SmoothL1Loss()
+        self.optimizer = self.create_optimizer(self.model)
 
-    for epoch in range(0, num_epochs):
-        print(f"Epoch {epoch}")
-        loss = torch.tensor(0.0).cuda()
-        num_samples = 0
+        self.loss = torch.nn.SmoothL1Loss(reduction="none")
+
+    def run_epoch(self, dataloader: DataLoader) -> None:
+        """Run the model through the dataloader one full time."""
+
+        seq_loss = torch.tensor(0.0).cuda()
+
         for i, sample in enumerate(dataloader):
+            print(i)
 
-            responders = sample["responders"].cuda()
+            # Move the sample to the GPU.
+            for k, v in sample.items():
+                sample[k] = v.cuda()
 
-            pred_probs, _ = model.forward(
-                date_ids=sample["date_id"].cuda(),
-                time_ids=sample["time_id"].cuda(),
-                symbol_ids=sample["symbol_id"].cuda(),
-                features=sample["features"].cuda(),
-                responders=responders,
+            predictions = self.model.forward(
+                date_ids=sample["date_id"],
+                time_ids=sample["time_id"],
+                symbol_ids=sample["symbol_id"],
+                features=sample["features"],
+                responders=sample["responders"],
             )
 
-            # targets = (100 * ((responders + 5.0) / 10.0)).long()
-            num_samples += responders.shape[1]
+            total_loss: torch.Tensor = self.loss(predictions, sample["responders"])
 
-            loss += torch.nn.functional.smooth_l1_loss(pred_probs, responders)
-            # loss += nll_loss.forward(
-            #     input=pred_probs.permute(0, 3, 1, 2).contiguous(), target=targets
-            # )
+            seq_loss += total_loss.mean()
 
-            if (i + 1) % train_seq_len == 0:
-                print(loss.item() / train_seq_len, num_samples)
-                loss.backward()
-                optim.step()
-                optim.zero_grad()
-                model.reset_memory()
-                num_samples = 0
-                loss = loss.zero_().detach()
+            if self.model.training and (i + 1) % self.train_seq_len == 0:
+                print(seq_loss / self.train_seq_len)
 
-    import pdb
+                seq_loss.backward()
 
-    pdb.set_trace()
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+
+                self.model.reset_memory()
+
+                seq_loss = seq_loss.zero_().detach()
+
+    def run(self) -> None:
+        """Running training and eval."""
+        for _ in range(self.num_epochs):
+            self.model.train()
+            self.run_epoch(dataloader=self.train_dataloader)
+
+            with torch.no_grad():
+                self.model.eval()
+                self.run_epoch(dataloader=self.val_dataloader)
+
+    @staticmethod
+    def create_dataloader(parquet_files: List[str], window_size: int, **kwargs) -> DataLoader:
+        """Create the parquet dataloader. Pass DataLoader options as kwargs."""
+        dataset = DatetimeParquetDataset(
+            file_paths=parquet_files, time_context_length=window_size, logging=False
+        )
+        return DataLoader(dataset=dataset, **kwargs)
+
+    @staticmethod
+    def create_model() -> torch.nn.Module:
+        """Create the model on GPU."""
+        return TransformerModel(
+            n_blocks=8,
+            n_feature_len=79,
+            n_responder_len=9,
+            n_query=4,
+            n_head=4,
+            d_model=1024,
+        ).cuda()
+
+    @staticmethod
+    def create_optimizer(model: torch.nn.Module, lr: float = 0.0001) -> torch.optim.Optimizer:
+        """Create the optimizer"""
+        return torch.optim.AdamW(
+            params=model.parameters(),
+            lr=lr,
+        )
+
+    def get_num_params(self) -> int:
+        """Get the number of trainable parameters in the model."""
+        return sum(p.shape.numel() for p in self.model.parameters() if p.requires_grad)
+
+    @staticmethod
+    def log_dataloader_info(dataloader: DataLoader, mode: str) -> None:
+        """Log the number of files and samples in each dataloader."""
+        print(
+            f"Created {mode} dataloader with {len(dataloader.dataset.file_paths)} files"
+            f" and {len(dataloader)} samples"
+        )
 
 
 if __name__ == "__main__":
-    train()
+    runner = ModelRunner()
+    runner.run()

@@ -31,9 +31,11 @@ class SwiGLUFeedForward(torch.nn.Module):
         Returns:
             output (torch.Tensor): Output tensor (..., n_feat)
         """
-        gate_tensor = self.swiglu_gate(x)
-        x = self.swish(self.linear1(x), self.swish_beta)
-        return self.linear2(x * gate_tensor)
+        def ckpt_fwd(x: torch.Tensor) -> torch.Tensor:
+            gate_tensor = self.swiglu_gate(x)
+            x = self.swish(self.linear1(x), self.swish_beta)
+            return self.linear2(x * gate_tensor)
+        return checkpoint(ckpt_fwd, x, use_reentrant=False)
 
 
 class RotaryPositionalEncoding(torch.nn.Module):

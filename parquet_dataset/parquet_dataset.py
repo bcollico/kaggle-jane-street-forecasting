@@ -4,8 +4,6 @@ from typing import Dict, List, Optional
 
 from dataclasses import dataclass
 
-from pathlib import Path
-
 import numpy as np
 import polars as pl
 import pyarrow.parquet as pq

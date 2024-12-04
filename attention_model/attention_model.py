@@ -96,7 +96,6 @@ class TransformerModel(torch.nn.Module):
         n_blocks: int,
         n_feature_len: int,
         n_responder_len: int,
-        n_output_bins: int,
         d_model: int,
         n_head: int,
         n_query: int,
@@ -109,8 +108,6 @@ class TransformerModel(torch.nn.Module):
             n_blocks (int): Number of transformer blocks to create.
             n_feature_len (int): Length for of the input features.
             n_responder_len (int): Length of the input lagged responders.
-            n_output_bins (int): Number of bins to predict in the output discrete probability
-                distribution.
             d_model (int): The size of the input dimension for each vector. For multi-head
                 attention, the feature length for each query is (`d_model / n_head / n_query`).
             n_query (int): The number of query projections to apply on head head. Must be a factor
@@ -164,9 +161,6 @@ class TransformerModel(torch.nn.Module):
 
         self.out_norm = torch.nn.LayerNorm(d_model)
         self.logit_linear = torch.nn.Linear(in_features=d_model, out_features=n_responder_len)
-        self.offset_linear = torch.nn.Linear(
-            in_features=d_model, out_features=n_responder_len * n_output_bins
-        )
         self.softmax = torch.nn.Softmax(dim=-1)
 
         # TODO rethink this cross attention situation -- if the responder at
@@ -300,12 +294,9 @@ class TransformerModel(torch.nn.Module):
                 information in the attention scores.
 
         Returns:
-            responder_distribution (torch.Tensor): (batch_size, seq_len, n_output_bins) probability
-                distribution over binned values.
-            responder_offset (torch.Tensor): (batch_size, seq_len, n_output_bins) predicted offset
-                from the center of each bin to the predicted value within that bin.
+            responder_distribution (torch.Tensor): (batch_size, seq_len, n_output_bins) responder
+                predictions.
         """
-        batch_size, seq_len = features.shape[:2]
         n_feature_len = features.shape[-1]
         n_responder_len = responders.shape[-1]
 
@@ -346,10 +337,7 @@ class TransformerModel(torch.nn.Module):
 
         out_norm = self.out_norm(out)
 
-        # Predict a discrete distribution over the responder variables.
-        responder_distribution = self.logit_linear(out_norm)
-        responder_offset = self.offset_linear(out_norm).reshape(
-            batch_size, seq_len, n_responder_len, -1
-        )
+        # Predict the responder variables.
+        predictions = self.logit_linear(out_norm)
 
-        return responder_distribution, responder_offset
+        return predictions
