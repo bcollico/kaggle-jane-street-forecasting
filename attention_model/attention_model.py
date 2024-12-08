@@ -87,8 +87,7 @@ class TransformerModel(torch.nn.Module):
             responder_embedding -> query projection -> queries
         `n_blocks` self attention blocks
         Predict:
-            Distribution over responder variables as discrete PDF with `n_bins` bins.
-            Offset from each bin center to the predicted value in each bin
+            Value of the responders.
     """
 
     def __init__(
@@ -146,7 +145,7 @@ class TransformerModel(torch.nn.Module):
         # seasonal trends via a memory mechanism. Perhaps this will have to be expanded to better
         # generalize to sequences across many more days than we have here.
         self.date_embedding = torch.nn.Embedding.from_pretrained(
-            torch.zeros(8, d_model), freeze=False
+            torch.zeros(365, d_model), freeze=False
         )
 
         # Absolute time embedding. The training dataset has <1000 absolute time indices. It's
@@ -241,16 +240,19 @@ class TransformerModel(torch.nn.Module):
         """
         mat: torch.Tensor = id_mat == id_mat.transpose(-1, -2)
         cumsum: torch.Tensor = torch.cumsum(mat, dim=-1)
-        return cumsum + torch.logical_not(mat) > mat.sum(dim=-2).unsqueeze(-1), cumsum.bool()
+        return (
+            (cumsum + torch.logical_not(mat) > mat.sum(dim=-2, keepdim=True)).unsqueeze(0),
+            cumsum.bool().unsqueeze(0),
+        )
 
     def create_date_and_time_masks(
-        self, date_id: torch.Tensor, time_id: torch.Tensor
+        self, time_id: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get the causal attention masks taking into account the date and time IDs.
 
         Args:
-            time_id (torch.Tensor): Time IDs (..., seq_len, 1).
-            date_id (torch.Tensor): Date IDs (..., seq_len, 1).
+            time_id (torch.Tensor): Time IDs (..., seq_len).
+            date_id (torch.Tensor): Date IDs (..., seq_len).
 
         Returns:
             self_attn_mask (torch.Tensor): Bool tensor with upper triangular set to True, including
@@ -259,7 +261,6 @@ class TransformerModel(torch.nn.Module):
                 diagonal. (..., seq_len, seq_len)
         """
         sa_mask_t, ca_mask_t = self.create_causal_masks(id_mat=time_id)
-        # sa_mask_d, ca_mask_d = self.create_causal_masks(id_mat=date_id)
         # TODO figure out if/how to mask on date + time and not just time. Assuming currently that
         # it might be sufficient to mask on time alone when the window is small enough since the
         # time id will wrap around from a large number to a small number when the sequence is
@@ -294,7 +295,7 @@ class TransformerModel(torch.nn.Module):
                 information in the attention scores.
 
         Returns:
-            responder_distribution (torch.Tensor): (batch_size, seq_len, n_output_bins) responder
+            predicted_responders (torch.Tensor): (batch_size, seq_len, n_responder_len) responder
                 predictions.
         """
         n_feature_len = features.shape[-1]
@@ -304,36 +305,31 @@ class TransformerModel(torch.nn.Module):
         assert n_feature_len == self.n_feature_len
 
         # Symbol and time embeddings use their absolute values.
-        symbol_emb = self.symbol_embedding(symbol_ids).squeeze(-2)
-        time_emb = self.time_embedding(time_ids).squeeze(-2)
+        symbol_emb = self.symbol_embedding(symbol_ids)
+        time_emb = self.time_embedding(time_ids)
 
         # Date embedding uses a relative value to the start of this sequence since date is
         # unbounded. TODO: try doing date_id % 365 so that it's bounded or (date_id % 365) % 12
         # to get the long-term seasonal embeddings
-        relative_date_emb = self.date_embedding(
-            date_ids - torch.min(date_ids, dim=-2).values.unsqueeze(-2)
-        ).squeeze(-2)
+        date_emb = self.date_embedding(date_ids % 365)
 
         # Create feature and responder embeddings.
         feature_emb = self.feature_embedding(features)
         responder_emb = self.responder_embedding(responders)
 
         # Augment feature embedding with time, date, and symbol embeddings.
-        feature_emb = feature_emb + time_emb + relative_date_emb + symbol_emb
+        feature_emb = feature_emb + time_emb + date_emb + symbol_emb
 
         # Create the masks for cross and self attention.
-        self_attn_mask, cross_attn_mask = self.create_date_and_time_masks(
-            date_id=date_ids, time_id=time_ids
-        )
+        with torch.no_grad():
+            self_attn_mask, cross_attn_mask = self.create_date_and_time_masks(time_id=time_ids)
 
         # Cross attention between the features and their lagged responders.
-        out = self.cross_attn_layer.forward(
-            x=responder_emb, y=feature_emb, mask=cross_attn_mask.unsqueeze(1)
-        )
+        out = self.cross_attn_layer.forward(x=responder_emb, y=feature_emb, mask=cross_attn_mask)
 
         # Self attention layers.
         for layer in self.layers:
-            out = layer.forward(x=out, mask=self_attn_mask.unsqueeze(1))
+            out = layer.forward(x=out, mask=self_attn_mask)
 
         out_norm = self.out_norm(out)
 
