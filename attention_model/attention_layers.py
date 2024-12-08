@@ -31,10 +31,12 @@ class SwiGLUFeedForward(torch.nn.Module):
         Returns:
             output (torch.Tensor): Output tensor (..., n_feat)
         """
+
         def ckpt_fwd(x: torch.Tensor) -> torch.Tensor:
             gate_tensor = self.swiglu_gate(x)
             x = self.swish(self.linear1(x), self.swish_beta)
             return self.linear2(x * gate_tensor)
+
         return checkpoint(ckpt_fwd, x, use_reentrant=False)
 
 
@@ -71,21 +73,21 @@ class RotaryPositionalEncoding(torch.nn.Module):
         Args:
             seq_len (int): Length of the sequence to precompute the positional encoding for.
         """
+        with torch.no_grad():
+            start = self.sin_pos.shape[0]
 
-        start = self.sin_pos.shape[0]
+            if start >= seq_len:
+                return
 
-        if start >= seq_len:
-            return
+            # Absolute indices in the sequence: (seq_len, 1)
+            position = torch.arange(start=start, end=seq_len, device=self.sin_pos.device).unsqueeze(1)
 
-        # Absolute indices in the sequence: (seq_len, 1)
-        position = torch.arange(start=start, end=seq_len, device=self.sin_pos.device).unsqueeze(1)
+            # Parameterized angles: (seq_len, d_model / 2)
+            angles = position * self.theta
 
-        # Parameterized angles: (seq_len, d_model / 2)
-        angles = position * self.theta
-
-        # Stack the new values in the sin/cos caches.
-        self.sin_pos = torch.vstack((self.sin_pos, torch.sin(angles)))
-        self.cos_pos = torch.vstack((self.cos_pos, torch.cos(angles)))
+            # Stack the new values in the sin/cos caches.
+            self.sin_pos = torch.vstack((self.sin_pos, torch.sin(angles)))
+            self.cos_pos = torch.vstack((self.cos_pos, torch.cos(angles)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Applies the positional encoding to the input tensor. Updates the
@@ -111,7 +113,7 @@ class RotaryPositionalEncoding(torch.nn.Module):
         sin_pos: torch.Tensor = self.sin_pos[:seq_len, :d_model_2]
 
         out = torch.empty_like(x)
-        out[..., ::2] = x_even * cos_pos - x_odd * sin_pos
+        out[..., 0::2] = x_even * cos_pos - x_odd * sin_pos
         out[..., 1::2] = x_odd * cos_pos + x_even * sin_pos
 
         return out
@@ -244,9 +246,7 @@ class GroupedQueryAttention(torch.nn.Module):
             attention_scores = torch.masked_fill(attention_scores, mask, value=-1e9)
         attention_probabilities = torch.nn.functional.softmax(attention_scores, dim=-1)
 
-        # TODO: Fix masked attention here to avoid NaN on first sample. Currently we just replace
-        # fill the nans with 0.0 in the attention layer to pass the features through inplace of nan.
-        attention_probabilities = torch.masked_fill(attention_probabilities, mask, value=0.0)
+        attention_probabilities = attention_probabilities * torch.logical_not(mask)
 
         # (n_b, n_query * n_head, n_seq, d_head) -> (n_b, n_seq, n_query * n_head, d_head)
         return (self.attn_dropout(attention_probabilities) @ value_t).transpose(1, 2)
@@ -431,12 +431,12 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
             key (torch.Tensor): attention key matrix of shape (n_b, n_seq, d_head * n_head).
             value (torch.Tensor): attention value matrix of shape (n_b, n_seq, d_head * n_head).
         """
-        sigma_k = self.mem_activation(key)
+        sigma_k: torch.Tensor = self.mem_activation(key)
         sigma_k_t = sigma_k.transpose(-2, -1)
 
-        # NOTE: Same issue with updating self.memory(_norm) here. Updating during the forward pass
-        # break backprop. Need to update this to delay the update until after we do backward().
-        batch_update = sigma_k_t @ (value - torch.div(sigma_k @ memory, sigma_k @ memory_norm))
+        batch_update = sigma_k_t @ (
+            value - torch.div(sigma_k @ memory, sigma_k @ memory_norm + 1e-8)
+        )
 
         self.memory += torch.sum(batch_update, dim=0)
         self.memory_norm += torch.sum(sigma_k, dim=(0, 1)).unsqueeze(-1)
@@ -514,4 +514,6 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
                 ).reshape(n_b, n_seq, d_model)
             )
 
-        return checkpoint(ckpt_fwd, x, self.memory.clone(), self.memory_norm.clone(), y, mask, use_reentrant=False)
+        return checkpoint(
+            ckpt_fwd, x, self.memory.clone(), self.memory_norm.clone(), y, mask, use_reentrant=False
+        )
