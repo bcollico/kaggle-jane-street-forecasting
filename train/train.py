@@ -1,5 +1,6 @@
 from typing import Any, Dict, List, OrderedDict
 from collections import OrderedDict
+import tqdm
 
 import os
 import sys
@@ -88,20 +89,14 @@ class ModelRunner:
             }
         )
 
-        return out
-
     def run_epoch(self, dataloader: DataLoader) -> None:
         """Run the model through the dataloader one full time."""
 
-        seq_loss = torch.tensor(0.0).cuda()
+        seq_loss: torch.Tensor = torch.tensor(0.0).cuda()
+        per_responder_loss: torch.Tensor = torch.zeros((9), requires_grad=False)
         total_len: int = 0
 
-        min_date: int = int(1e9)
-        max_date: int = 0
-        min_time: int = int(1e9)
-        max_time: int = 0
-
-        for i, sample in enumerate(dataloader):
+        for i, sample in tqdm.tqdm(enumerate(dataloader)):
             # TODO for training, sample the dataloader to start at different dates so that the model
             # sees slightly different sequences on each epoch
 
@@ -120,49 +115,41 @@ class ModelRunner:
             total_len += predictions.shape[1]
             seq_loss += total_loss.mean()
 
-            min_date = min(sample["date_id"].min().detach().item(), min_date)
-            max_date = max(sample["date_id"].min().detach().item(), max_date)
-            min_time = min(sample["time_id"].min().detach().item(), min_time)
-            max_time = max(sample["time_id"].min().detach().item(), max_time)
+            # Sum to (n_responder_len,) shape and add to running total
+            per_responder_loss += total_loss.cpu().detach().sum(dim=(0, 1))
 
             if self.model.training and (i + 1) % self.train_seq_len == 0:
-
-                print(f"Date range: ({min_date}, {max_date})")
-                print(f"Time range: ({min_time}, {max_time})")
-                print(
-                    seq_loss / self.train_seq_len,
-                    total_len,
-                    f"{torch.cuda.memory_allocated(0) / 1e9:0.4f}gb" ,
-                )
 
                 seq_loss.backward()
 
                 self.optimizer.step()
                 self.optimizer.zero_grad()
 
+                # Reset the model memory matrices for the next sequence.
                 self.model.reset_memory()
 
                 seq_loss = seq_loss.zero_().detach()
 
-                min_date = int(1e9)
-                max_date = 0
-                min_time = int(1e9)
-                max_time = 0
-
                 total_len = 0
-                import pdb; pdb.set_trace()
-                torch.cuda.empty_cache()
+                per_responder_loss.zero_()
 
         if not self.model.training:
-            print(f"Validation loss: {seq_loss / len(dataloader)}")
+            print(f"Mean responder error: {per_responder_loss / total_len}")
 
     def run(self) -> None:
         """Running training and eval."""
-        for _ in range(self.num_epochs):
+        with torch.no_grad():
+                print("Running baseline validation epoch...")
+                self.model.eval()
+                self.run_epoch(dataloader=self.val_dataloader)
+
+        for i in range(self.num_epochs):
+            print(f"Training epoch {i}...")
             self.model.train()
             self.run_epoch(dataloader=self.train_dataloader)
 
             with torch.no_grad():
+                print(f"Validating epoch {i}")
                 self.model.eval()
                 self.run_epoch(dataloader=self.val_dataloader)
 
@@ -207,6 +194,7 @@ class ModelRunner:
         )
 
     def profile(self) -> None:
+        """Run pytorch CPU and GPU profiler on the model and print to console."""
         from torch.profiler import profile, ProfilerActivity
 
         inputs = self.make_dummy_input(seq_len=1000)
@@ -227,7 +215,11 @@ class ModelRunner:
 
         print(prof.key_averages().table(sort_by="cuda_memory_usage"))
 
+
 def scalene_profile():
+    """Simple runner to profile a training step. To be invoked with Scalene profiler. via
+    `scalene train/train.py` from command line.
+    """
     model = ModelRunner.create_model()
     inputs = ModelRunner.make_dummy_input(seq_len=1000)
     dict_to_cuda(inputs)
