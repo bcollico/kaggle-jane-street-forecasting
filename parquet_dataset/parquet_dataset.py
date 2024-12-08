@@ -267,9 +267,9 @@ class DatetimeParquetDataset(ParquetDataset):
         # TODO Figure out how ot use the lagged responders properly since we don't necessarily have
         # the same symbols from timestamp to timestamp.
         return {
-            "date_id": rows[:, 0:1].int(),
-            "time_id": rows[:, 1:2].int(),
-            "symbol_id": rows[:, 2:3].int(),
+            "date_id": rows[:, 0].int(),
+            "time_id": rows[:, 1].int(),
+            "symbol_id": rows[:, 2].int(),
             "features": rows[:, 4:83],
             "responders": rows[:, 83:92],
         }
