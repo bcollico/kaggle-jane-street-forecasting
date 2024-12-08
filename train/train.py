@@ -1,4 +1,5 @@
-from typing import List
+from typing import Any, Dict, List, OrderedDict
+from collections import OrderedDict
 
 import os
 import sys
@@ -27,10 +28,16 @@ def make_parquet_path(i: int) -> str:
     )
 
 
+def dict_to_cuda(sample: Dict[Any, torch.Tensor]) -> None:
+    """In-place move tensors in a dictionary to CUDA."""
+    for k, v in sample.items():
+        sample[k] = v.cuda()
+
+
 class ModelRunner:
     """Model running class for training."""
 
-    def __init__(self, num_epochs: int = 10, train_seq_len: int = 32) -> None:
+    def __init__(self, num_epochs: int = 10, train_seq_len: int = 128) -> None:
 
         self.num_epochs = num_epochs
         self.train_seq_len = train_seq_len
@@ -55,27 +62,51 @@ class ModelRunner:
 
         self.model = self.create_model()
         print(f"Created model with {self.get_num_params()} parameters")
+
+        dummy_inputs: Dict[str, torch.Tensor] = self.make_dummy_input()
         summary(
             self.model,
-            input_size=[(1, 6000, 1), (1, 6000, 1), (1, 6000, 1), (1, 6000, 79), (1, 6000, 9)],
-            dtypes=[torch.int64, torch.int64, torch.int64, torch.float32, torch.float32],
+            input_data=list(dummy_inputs.values()),
         )
 
         self.optimizer = self.create_optimizer(self.model)
 
         self.loss = torch.nn.SmoothL1Loss(reduction="none")
 
+    @staticmethod
+    def make_dummy_input(seq_len: int = 6000) -> OrderedDict[str, torch.Tensor]:
+        """Make dummy input tensors to the model. Output in ordered dict so that they can be used
+        with or without keyword arguments."""
+
+        return OrderedDict(
+            {
+                "date_ids": torch.randint(0, 1500, (1, seq_len)).long(),
+                "time_ids": torch.randint(0, 1000, (1, seq_len)).long(),
+                "symbol_ids": torch.randint(0, 256, (1, seq_len)).long(),
+                "features": torch.randn((1, seq_len, 79)).float(),
+                "responders": torch.randn((1, seq_len, 9)).float(),
+            }
+        )
+
+        return out
+
     def run_epoch(self, dataloader: DataLoader) -> None:
         """Run the model through the dataloader one full time."""
 
         seq_loss = torch.tensor(0.0).cuda()
+        total_len: int = 0
+
+        min_date: int = int(1e9)
+        max_date: int = 0
+        min_time: int = int(1e9)
+        max_time: int = 0
 
         for i, sample in enumerate(dataloader):
-            print(i)
+            # TODO for training, sample the dataloader to start at different dates so that the model
+            # sees slightly different sequences on each epoch
 
             # Move the sample to the GPU.
-            for k, v in sample.items():
-                sample[k] = v.cuda()
+            dict_to_cuda(sample=sample)
 
             predictions = self.model.forward(
                 date_ids=sample["date_id"],
@@ -86,11 +117,23 @@ class ModelRunner:
             )
 
             total_loss: torch.Tensor = self.loss(predictions, sample["responders"])
-
+            total_len += predictions.shape[1]
             seq_loss += total_loss.mean()
 
+            min_date = min(sample["date_id"].min().detach().item(), min_date)
+            max_date = max(sample["date_id"].min().detach().item(), max_date)
+            min_time = min(sample["time_id"].min().detach().item(), min_time)
+            max_time = max(sample["time_id"].min().detach().item(), max_time)
+
             if self.model.training and (i + 1) % self.train_seq_len == 0:
-                print(seq_loss / self.train_seq_len)
+
+                print(f"Date range: ({min_date}, {max_date})")
+                print(f"Time range: ({min_time}, {max_time})")
+                print(
+                    seq_loss / self.train_seq_len,
+                    total_len,
+                    f"{torch.cuda.memory_allocated(0) / 1e9:0.4f}gb" ,
+                )
 
                 seq_loss.backward()
 
@@ -100,6 +143,18 @@ class ModelRunner:
                 self.model.reset_memory()
 
                 seq_loss = seq_loss.zero_().detach()
+
+                min_date = int(1e9)
+                max_date = 0
+                min_time = int(1e9)
+                max_time = 0
+
+                total_len = 0
+                import pdb; pdb.set_trace()
+                torch.cuda.empty_cache()
+
+        if not self.model.training:
+            print(f"Validation loss: {seq_loss / len(dataloader)}")
 
     def run(self) -> None:
         """Running training and eval."""
@@ -123,12 +178,12 @@ class ModelRunner:
     def create_model() -> torch.nn.Module:
         """Create the model on GPU."""
         return TransformerModel(
-            n_blocks=8,
+            n_blocks=1,
             n_feature_len=79,
             n_responder_len=9,
             n_query=4,
             n_head=4,
-            d_model=1024,
+            d_model=512,
         ).cuda()
 
     @staticmethod
@@ -150,6 +205,35 @@ class ModelRunner:
             f"Created {mode} dataloader with {len(dataloader.dataset.file_paths)} files"
             f" and {len(dataloader)} samples"
         )
+
+    def profile(self) -> None:
+        from torch.profiler import profile, ProfilerActivity
+
+        inputs = self.make_dummy_input(seq_len=1000)
+        dict_to_cuda(sample=inputs)
+
+        print("Running profiler...")
+
+        self.model.train()
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            profile_memory=True,
+            record_shapes=True,
+            with_stack=True,
+        ) as prof:
+            out: torch.Tensor = self.model(**inputs)
+            out.mean().backward()
+
+        print(prof.key_averages().table(sort_by="cuda_memory_usage"))
+
+def scalene_profile():
+    model = ModelRunner.create_model()
+    inputs = ModelRunner.make_dummy_input(seq_len=1000)
+    dict_to_cuda(inputs)
+
+    out: torch.Tensor = model(**inputs)
+    out.backward()
 
 
 if __name__ == "__main__":
