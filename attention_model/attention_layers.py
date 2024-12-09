@@ -44,12 +44,19 @@ class RotaryPositionalEncoding(torch.nn.Module):
     """Vanilla Rotary Positional Encoding (RoPE) implementation: https://arxiv.org/pdf/2104.09864"""
 
     def __init__(
-        self, d_model: int, base: int = 10000, device: torch.DeviceObjType = torch.device("cuda")
+        self,
+        d_model: int,
+        base: int = 10000,
+        device: torch.DeviceObjType = torch.device("cuda"),
+        enable_sin_cos_caching: bool = False,
     ):
         """
         Args:
             d_model (int): Expected length of the input token embeddings.
             base (int): Base value to raised to the power of -2i/d_model.
+            device (torch.DeviceObjType): Device to store sin/cos cache on.
+            enable_sin_cos_caching (bool): Flag to enable caching of sin/cos matrices. Increase
+                memory use at the expense of runtime.
         """
         super().__init__()
 
@@ -61,9 +68,11 @@ class RotaryPositionalEncoding(torch.nn.Module):
         self.cos_pos: torch.Tensor = torch.empty(0, d_model_2).to(device)
 
         # theta parameter vector: (1, d_model / 2)
-        self.theta = torch.tensor(base, device=device) ** (
+        self.theta: torch.Tensor = torch.tensor(base, device=device) ** (
             -torch.arange(d_model_2, device=device) / (d_model_2)
         ).unsqueeze(0)
+
+        self.use_cache: bool = enable_sin_cos_caching
 
     def _allocate_sin_cos(self, seq_len: int) -> None:
         """Allocate sin cos caches for rotary positional encoding. Only calculates
@@ -79,17 +88,22 @@ class RotaryPositionalEncoding(torch.nn.Module):
             if start >= seq_len:
                 return
 
-            # Absolute indices in the sequence: (seq_len, 1)
-            position = torch.arange(start=start, end=seq_len, device=self.sin_pos.device).unsqueeze(
-                1
+            cos_pos, sin_pos = self._calc_sin_cos_mats(
+                start=0, end=seq_len, d_model_2=self.theta.shape[-1], device=self.theta.device
             )
 
-            # Parameterized angles: (seq_len, d_model / 2)
-            angles = position * self.theta
-
             # Stack the new values in the sin/cos caches.
-            self.sin_pos = torch.vstack((self.sin_pos, torch.sin(angles)))
-            self.cos_pos = torch.vstack((self.cos_pos, torch.cos(angles)))
+            self.sin_pos = torch.vstack((self.sin_pos, sin_pos))
+            self.cos_pos = torch.vstack((self.cos_pos, cos_pos))
+
+    def _calc_sin_cos_mats(
+        self, start: int, end: int, d_model_2: int, device: torch.DeviceObjType
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute the sin and cos matrices for a given start/end and model dimension."""
+        self.theta = self.theta.to(device)
+        position: torch.Tensor = torch.arange(start=start, end=end, device=device).unsqueeze(1)
+        angles: torch.Tensor = position * self.theta[..., :d_model_2]
+        return torch.cos(angles), torch.sin(angles)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Applies the positional encoding to the input tensor. Updates the
@@ -104,15 +118,22 @@ class RotaryPositionalEncoding(torch.nn.Module):
         # Update the cache if necessary.
         seq_len, d_model = x.shape[-2], x.shape[-1]
         d_model_2: int = int(d_model / 2)
-        self._allocate_sin_cos(seq_len=seq_len)
 
-        self.sin_pos = self.sin_pos.to(x.device)
-        self.cos_pos = self.cos_pos.to(x.device)
+        with torch.no_grad():
+            if self.use_cache:
+                self._allocate_sin_cos(seq_len=seq_len)
+
+                self.sin_pos = self.sin_pos.to(x.device)
+                self.cos_pos = self.cos_pos.to(x.device)
+
+                cos_pos: torch.Tensor = self.cos_pos[:seq_len, :d_model_2]
+                sin_pos: torch.Tensor = self.sin_pos[:seq_len, :d_model_2]
+            else:
+                cos_pos, sin_pos = self._calc_sin_cos_mats(
+                    start=0, end=seq_len, d_model_2=d_model_2, device=x.device
+                )
 
         x_even, x_odd = x[..., ::2], x[..., 1::2]
-
-        cos_pos: torch.Tensor = self.cos_pos[:seq_len, :d_model_2]
-        sin_pos: torch.Tensor = self.sin_pos[:seq_len, :d_model_2]
 
         out = torch.empty_like(x)
         out[..., 0::2] = x_even * cos_pos - x_odd * sin_pos
