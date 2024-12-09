@@ -80,7 +80,9 @@ class RotaryPositionalEncoding(torch.nn.Module):
                 return
 
             # Absolute indices in the sequence: (seq_len, 1)
-            position = torch.arange(start=start, end=seq_len, device=self.sin_pos.device).unsqueeze(1)
+            position = torch.arange(start=start, end=seq_len, device=self.sin_pos.device).unsqueeze(
+                1
+            )
 
             # Parameterized angles: (seq_len, d_model / 2)
             angles = position * self.theta
@@ -206,40 +208,41 @@ class GroupedQueryAttention(torch.nn.Module):
         """Apply SDPA using grouped query attention from https://arxiv.org/pdf/2305.13245.
 
         Args:
-            query (torch.Tensor):: attention query matrix of shape (n_b, n_seq, d_model) where
+            query (torch.Tensor):: attention query matrix of shape (n_b, n_seq_q, d_model) where
                 d_model = n_query * n_head * d_head
-            key (torch.Tensor): attention key matrix of shape (n_b, n_seq, d_head * n_head).
-            value (torch.Tensor): attention value matrix of shape (n_b, n_seq, d_head * n_head).
-            mask (torch.Tensor | None) Optional mask of shape (batch_size, 1, n_seq, n_seq) for
+            key (torch.Tensor): attention key matrix of shape (n_b, n_seq_kv, d_head * n_head).
+            value (torch.Tensor): attention value matrix of shape (n_b, n_seq_kv, d_head * n_head).
+            mask (torch.Tensor | None) Optional mask of shape (batch_size, 1, n_seq_q, n_seq_kv) for
                 casual attention.
 
         Returns:
             attention_output (torch.Tensor): Attention output of shape
-                (n_b, n_seq, n_query * n_head, d_head).
+                (n_b, n_seq_q, n_query * n_head, d_head).
         """
-        n_b, n_seq = query.shape[:2]
+        n_b, n_seq_q = query.shape[:2]
+        n_seq_kv = key.shape[-2]
 
         # TODO: figure out how to remove the `repeat_interleave` here to compute the
         # grouped attention without copying the key and value data.
 
-        # (n_b, n_head * n_query, d_head, n_seq)
+        # (n_b, n_head * n_query, d_head, n_seq_q)
         key_t = (
-            key.view(n_b, n_seq, self.n_head, self.d_head)
+            key.view(n_b, n_seq_kv, self.n_head, self.d_head)
             .repeat_interleave(self.n_query, -2)
             .permute(0, 2, 3, 1)
         )
 
-        # (n_b, n_query * n_head, n_seq, d_head)
-        query_t = query.view(n_b, n_seq, self.n_query * self.n_head, self.d_head).transpose(1, 2)
+        # (n_b, n_query * n_head, n_seq_q, d_head)
+        query_t = query.view(n_b, n_seq_q, self.n_query * self.n_head, self.d_head).transpose(1, 2)
 
-        # (n_b, n_query * n_head, n_seq, d_head)
+        # (n_b, n_query * n_head, n_seq_q, d_head)
         value_t = (
-            value.view(n_b, n_seq, self.n_head, self.d_head)
+            value.view(n_b, n_seq_kv, self.n_head, self.d_head)
             .repeat_interleave(self.n_query, -2)
             .transpose(1, 2)
         )
 
-        # (n_b, n_query * n_head, n_seq, n_seq)
+        # (n_b, n_query * n_head, n_seq_q, n_seq_q)
         attention_scores = query_t @ key_t * self.attention_scale
 
         if mask is not None:
@@ -248,7 +251,7 @@ class GroupedQueryAttention(torch.nn.Module):
 
         attention_probabilities = attention_probabilities * torch.logical_not(mask)
 
-        # (n_b, n_query * n_head, n_seq, d_head) -> (n_b, n_seq, n_query * n_head, d_head)
+        # (n_b, n_query * n_head, n_seq_q, d_head) -> (n_b, n_seq_q, n_query * n_head, d_head)
         return (self.attn_dropout(attention_probabilities) @ value_t).transpose(1, 2)
 
     def kqv(
@@ -267,17 +270,17 @@ class GroupedQueryAttention(torch.nn.Module):
         """Calculate the attention output using scaled dot product attention.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (n_b, n_seq, d_model).
-            y (torch.Tensor): Optional batched tensor of shape (n_b, n_seq, d_model), if present,
+            x (torch.Tensor): Input tensor of shape (n_b, n_seq_q, d_model).
+            y (torch.Tensor): Optional batched tensor of shape (n_b, n_seq_kv, d_model), if present,
                 the layer calculates cross-attention between x and y by using x to compute the query
                 and y to compute the keys and values.
             return_qkv (bool): Return the query, key, and value matrices (in that order) in addition
                 to the the attention output
-            mask (torch.Tensor | None) Optional mask of shape (batch_size, 1, n_seq, n_seq) for
+            mask (torch.Tensor | None) Optional mask of shape (batch_size, 1, n_seq_q, n_seq_kv) for
                 casual attention.
         Output:
             attention_output (torch.Tensor): Attention output of shape
-                (n_b, n_seq, n_query * n_head, d_head)
+                (n_b, n_seq_q, n_query * n_head, d_head)
 
         """
 
@@ -296,7 +299,7 @@ class GroupedQueryAttention(torch.nn.Module):
         if return_qkv:
             return attention_output, query, key, value
 
-        # (n_b, n_seq, n_query * n_head, d_head)
+        # (n_b, n_seq_q, n_query * n_head, d_head)
         return attention_output
 
     def forward(
@@ -307,23 +310,23 @@ class GroupedQueryAttention(torch.nn.Module):
         output with the memory attention.
 
         Args:
-            x (torch.Tensor): Batched tensor of shape (n_b, n_seq, d_model)
-            y (torch.Tensor): Optional batched tensor of shape (n_b, n_seq, d_model), if present,
+            x (torch.Tensor): Batched tensor of shape (n_b, n_seq_q, d_model)
+            y (torch.Tensor): Optional batched tensor of shape (n_b, n_seq_kv, d_model), if present,
                 the layer calculates cross-attention between x and y by using x to compute the query
                 and y to compute the keys and values.
-            mask (torch.Tensor | None) Optional mask of shape (batch_size, 1, n_seq, n_seq) for
+            mask (torch.Tensor | None) Optional mask of shape (batch_size, 1, n_seq_q, n_seq_kv) for
                 casual attention.
         Returns:
-            (torch.Tensor): Batched tensor of shape (n_b, n_seq, d_model)
+            (torch.Tensor): Batched tensor of shape (n_b, n_seq_q, d_model)
         """
 
-        n_b, n_seq, d_model = x.shape
+        n_b, n_seq_q, d_model = x.shape
 
-        # (n_b, n_seq, n_query * n_head, d_head)
+        # (n_b, n_seq_q, n_query * n_head, d_head)
         attention_out = self.calculate_attention_output(x=x, y=y, mask=mask)
 
-        # (n_b, n_seq, n_query * n_head, d_head) -> ((n_b, n_seq, d_model))
-        return self.attn_proj(attention_out.reshape(n_b, n_seq, d_model))
+        # (n_b, n_seq_q, n_query * n_head, d_head) -> ((n_b, n_seq_q, d_model))
+        return self.attn_proj(attention_out.reshape(n_b, n_seq_q, d_model))
 
 
 class InfiniGroupedQueryAttention(GroupedQueryAttention):
@@ -396,26 +399,28 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
         of the attention layer, `A_mem`.
 
         Args:
-            query (torch.Tensor):: attention query matrix of shape (n_b, n_seq, d_model) where
+            query (torch.Tensor):: attention query matrix of shape (n_b, n_seq_q, d_model) where
                 d_model = n_query * n_head * d_head
         Returns:
             (torch.Tensor): Memory contribution to the attention, shape
-                (n_b, n_seq, n_query * n_head, d_head)
+                (n_b, n_seq_q, n_query * n_head, d_head)
         """
-        n_b, n_seq = query.shape[:2]
+        n_b, n_seq_q = query.shape[:2]
 
-        # (n_b, n_seq, n_query, n_head * d_head)
+        # (n_b, n_seq_q, n_query, n_head * d_head)
         sigma_q = self.mem_activation(
-            query.view(n_b, n_seq, self.n_query, self.n_head * self.d_head)
+            query.view(n_b, n_seq_q, self.n_query, self.n_head * self.d_head)
         )
 
-        # (n_b, n_seq, n_query,  n_head * d_head) @ (d_head * n_head, d_head * n_head) =
-        # (n_b, n_seq, n_query * self.n_head, self.d_head)
+        # (n_b, n_seq_q, n_query,  n_head * d_head) @ (d_head * n_head, d_head * n_head) =
+        # (n_b, n_seq_q, n_query * self.n_head, self.d_head)
         # Use torch.clone here since we modify self.memory and self.memory_norm in-place during
         # the forward pass, which breaks the backward pass during training.
         num = sigma_q @ memory
         den = sigma_q @ memory_norm
-        return torch.div(num, den + 1e-8).view(n_b, n_seq, self.n_query * self.n_head, self.d_head)
+        return torch.div(num, den + 1e-8).view(
+            n_b, n_seq_q, self.n_query * self.n_head, self.d_head
+        )
 
     def update_memory(
         self,
@@ -428,8 +433,8 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
         of the attention layer.
 
         Args:
-            key (torch.Tensor): attention key matrix of shape (n_b, n_seq, d_head * n_head).
-            value (torch.Tensor): attention value matrix of shape (n_b, n_seq, d_head * n_head).
+            key (torch.Tensor): attention key matrix of shape (n_b, n_seq_kv, d_head * n_head).
+            value (torch.Tensor): attention value matrix of shape (n_b, n_seq_kv, d_head * n_head).
         """
         sigma_k: torch.Tensor = self.mem_activation(key)
         sigma_k_t = sigma_k.transpose(-2, -1)
@@ -456,12 +461,12 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
 
         Args:
             attention_out (torch.Tensor): Attention output tensor `A_out` of shape
-                (n_b, n_seq, n_query * n_head, d_head).
+                (n_b, n_seq_q, n_query * n_head, d_head).
             attention_memory (torch.Tensor): Attention memory tensor `A_mem` of shape
-                (n_b, n_seq, n_query * n_head, d_head).
+                (n_b, n_seq_q, n_query * n_head, d_head).
         Returns:
             (torch.Tensor): local and context attention fused output
-                (n_b, n_seq, n_query * n_head,  d_head).
+                (n_b, n_seq_q, n_query * n_head,  d_head).
         """
         mem_weight = torch.nn.functional.sigmoid(self.memory_weight).view(1, 1, -1, 1)
         return attention_out * (1.0 - mem_weight) + attention_memory * mem_weight
@@ -474,14 +479,15 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
         output with the memory attention.
 
         Args:
-            x (torch.Tensor): Batched tensor of shape (n_b, n_seq, d_model)
-            y (torch.Tensor): Optional batched tensor of shape (n_b, n_seq, d_model), if present,
+            x (torch.Tensor): Batched tensor of shape (n_b, n_seq_q, d_model)
+            y (torch.Tensor): Optional batched tensor of shape (n_b, n_seq_kv, d_model), if present,
                 the layer calculates cross-attention between x and y by using x to compute the query
                 and y to compute the keys and values.
-            mask (torch.Tensor | None) Optional mask of shape (batch_size, 1, n_seq, n_seq) for casual attention.
+            mask (torch.Tensor | None) Optional mask of shape (batch_size, 1, n_seq_q, n_seq_kv)
+                for casual attention.
 
         Returns:
-            (torch.Tensor): Batched tensor of shape (n_b, n_seq, d_model)
+            (torch.Tensor): Batched tensor of shape (n_b, n_seq_q, d_model)
         """
 
         def ckpt_fwd(
@@ -492,14 +498,14 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
             mask: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
 
-            n_b, n_seq, d_model = x.shape
+            n_b, n_seq_q, d_model = x.shape
 
-            # (n_b, n_seq, n_query * n_head, d_head)
+            # (n_b, n_seq_q, n_query * n_head, d_head)
             attention_out, query, key, value = self.calculate_attention_output(
                 x=x, y=y, return_qkv=True, mask=mask
             )
 
-            # (n_b, n_seq, n_query * n_head, d_head)
+            # (n_b, n_seq_q, n_query * n_head, d_head)
             attention_memory = self.calculate_memory_attention(
                 query=query, memory=memory, memory_norm=memory_norm
             )
@@ -507,11 +513,11 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
             # Update the memory matrix and normalization term in-place.
             self.update_memory(key=key, value=value, memory=memory, memory_norm=memory_norm)
 
-            # (n_b, n_seq, n_query * n_head, d_head) -> ((n_b, n_seq, d_model))
+            # (n_b, n_seq_q, n_query * n_head, d_head) -> ((n_b, n_seq_q, d_model))
             return self.attn_proj(
                 self.calculate_recurrent_attention(
                     attention_out=attention_out, attention_memory=attention_memory
-                ).reshape(n_b, n_seq, d_model)
+                ).reshape(n_b, n_seq_q, d_model)
             )
 
         return checkpoint(
