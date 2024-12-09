@@ -1,6 +1,6 @@
 """Torch dataset definition."""
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from dataclasses import dataclass
 
@@ -22,7 +22,15 @@ def _get_cumulative_counts(raw_counts: List[int]) -> np.ndarray:
 
 def _calculate_index_from_cumulative_counts(idx: int, counts: np.ndarray) -> int:
     """Find the index of the nearest value in `counts` that is <= idx. Assumes that
-    `counts` is monotonically increasing."""
+    `counts` is monotonically increasing.
+
+    Args:
+        idx (int): Value to search for in the counts array.
+        counts (np.ndarray): Non-decreasing numpy array to search.
+
+    Returns:
+        out (int): The index of the first value in the array that is <= `idx`.
+    """
     return np.searchsorted(a=counts, v=idx, side="right") - 1
 
 
@@ -40,9 +48,9 @@ class RowGroupOffset:
 class RowGroupCache:
     """POD for holding the currently cached Parquet row group."""
 
-    file_idx: int
-    row_group_idx: int
-    df: pl.DataFrame
+    file_idx: int  # Overall file index in the parquet dataset.
+    row_group_idx: int  # Overall row group index in the parquet dataset
+    df: pl.DataFrame  # Cached dataframe
 
 
 class ParquetDataset(Dataset):
@@ -173,13 +181,15 @@ class ParquetDataset(Dataset):
 
 @dataclass
 class DateTimeSegment:
-    # List of file/rowgroup segment ids for this unique datetime
-    date: int
-    time: int
-    start_offset: int
-    end_offset: int
-    start_idx: int
-    end_idx: int
+    """Helper class with metadata for retrieving a the rows for a single date+time from the overall
+    parquet dataset."""
+
+    date: int  # Date ID
+    time: int  # Time ID
+    start_offset: int  # Overall row index where this date/time starts
+    end_offset: int  # Overall row index where the next date/time starts
+    start_idx: int  # Start row group index
+    end_idx: int  # End row group index
 
 
 class DatetimeParquetDataset(ParquetDataset):
@@ -203,6 +213,12 @@ class DatetimeParquetDataset(ParquetDataset):
         self._finalize_dt_segments()
 
     def _populate_partial_dt_segments(self) -> None:
+        """Iterate the parquet files in the dataset and partially populate the DateTimeSegments
+        by iterating over the dates+times in each file and noting the starting location of each
+        unique date and time.
+
+        Only the Date, Time, and Starting Row Offset are populated here. The Ending Row Offset,
+        Starting Row Group Index, and Ending Row Group Index are populated in the next step."""
         prev_date, prev_time = None, None
         for file_idx, file in enumerate(self.file_paths):
 
@@ -232,9 +248,16 @@ class DatetimeParquetDataset(ParquetDataset):
                     prev_time = time
 
     def _finalize_dt_segments(self) -> None:
-        # get the start and end segments
+        """Finalize the DateTimeSegments by populating the Ending Row Offset, Starting Row Group
+        Index, and Ending Row Group Index.
+
+        Using the list of partially populated DateTimeSegments, fill the end row offset. Search
+        the list of RowGroupOffsets for the start/end row group offset for each date/time."""
+
         for i in range(len(self.date_time_segments) - 1):
             seg_1, seg_2 = self.date_time_segments[i], self.date_time_segments[i + 1]
+
+            # Find the start and end row group indices for this date/time.
             start_idx = _calculate_index_from_cumulative_counts(
                 seg_1.start_offset, self.cum_total_counts_np
             )
@@ -242,10 +265,12 @@ class DatetimeParquetDataset(ParquetDataset):
                 seg_2.start_offset - 1, self.cum_total_counts_np
             )
 
+            # Set the end offset using the start of the next segment.
             seg_1.end_offset = seg_2.start_offset
             seg_1.start_idx = start_idx
             seg_1.end_idx = end_idx
 
+        # Set the final segment metadata knowing the total number of row groups and rows.
         final_segment = self.date_time_segments[-1]
         final_segment.start_idx = _calculate_index_from_cumulative_counts(
             final_segment.start_offset, self.cum_total_counts_np
@@ -254,37 +279,71 @@ class DatetimeParquetDataset(ParquetDataset):
         final_segment.end_offset = self.total_num_rows
 
     def __len__(self) -> int:
+        """Return the number of date/time windows in the dataset."""
         return len(self.date_time_segments) // self.time_context_length
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """Get a date/time window.
+
+        Args:
+            idx (int): Index of the last date/time of the window to return.
+
+        Returns:
+            sample (Dict[str, torch.Tensor]): Dictionary of tensors that make up the rows of the
+                table from date/time indices in [`idx-window_size`, `idx`]. Includes the offsets
+                for indexing each date/time individually.
+
+        """
         idx = idx * self.time_context_length + self.time_context_length
 
-        rows = self._get_dt_sample_range(
-            start_idx=max(0, idx - self.time_context_length),
+        rows, row_offsets = self._get_dt_sample_range(
+            start_idx=max(0, idx - self.time_context_length - 1),
             end_idx=min(len(self.date_time_segments) - 1, idx),
         )
 
-        # TODO Figure out how ot use the lagged responders properly since we don't necessarily have
-        # the same symbols from timestamp to timestamp.
         return {
+            "row_offsets": row_offsets,
             "date_id": rows[:, 0].int(),
             "time_id": rows[:, 1].int(),
             "symbol_id": rows[:, 2].int(),
-            "features": rows[:, 4:83],
-            "responders": rows[:, 83:92],
+            "weights": rows[:, 3],
+            "features": rows[row_offsets[1] :, 4:83],
+            "lags": rows[: row_offsets[-1], 83:92],
+            "responders_t": rows[row_offsets[-1] :, 83:92],
         }
 
-    def _get_dt_sample_range(self, start_idx: int, end_idx: int) -> torch.Tensor:
+    def _get_dt_sample_range(self, start_idx: int, end_idx: int) -> Tuple[torch.Tensor, int]:
+        """Get a range of date time samples by their start and end linear indices in the list of
+        DateTimeSegments. If we know the range of date/time sample to retrieve, we can batch them
+        by loading entire row groups at a time rather than iterating over all of the individual date
+        time indices and loading each one individually from the table.
+
+        Args:
+            start_idx (int): Date/Time linear index of the earliest date/time segment to load
+            end_idx (int): Date/Time linear index of the latest date/time segment to load
+        Returns
+            rows (torch.Tensor): A torch tensor containing the collected output rows for the
+                requested date/times.
+            row_offsets (int) The cumulative number of rows per date/time. E.g. to get the row where
+                the third date/time in this sample starts, index the `rows` tensor at
+                row_offsets[2].
+        """
+
+        # Start and end DateTimeSegments to retrieve from. Get their start and end row group index.
+        # We load/cache a row group at a time, so knowing the start and end row group allows for
+        # efficient reading of full groups per iteration.
         start_segment, end_segment = (
             self.date_time_segments[start_idx],
             self.date_time_segments[end_idx],
         )
-        start_idx = start_segment.start_idx
-        end_idx = end_segment.end_idx
+        start_row_group_idx = start_segment.start_idx
+        end_row_group_idx = end_segment.end_idx
 
         df_list: List[torch.Tensor] = []
-        for total_idx in range(start_idx, end_idx + 1):
-            group: RowGroupOffset = self.cum_total_counts[total_idx]
+        for row_group_idx in range(start_row_group_idx, end_row_group_idx + 1):
+
+            # Get the RowGroupOffset metadata for this row group and load it from the parquet file.
+            group: RowGroupOffset = self.cum_total_counts[row_group_idx]
             self._load_pq_file(
                 file_idx=group.file_idx,
                 row_group_idx=group.row_group_idx,
@@ -294,7 +353,7 @@ class DatetimeParquetDataset(ParquetDataset):
             # If it's greater than zero, we need to discard some rows from the start of this row
             # group.
             start_offset = (
-                0 if total_idx != start_idx else start_segment.start_offset - group.offset
+                0 if row_group_idx != start_idx else start_segment.start_offset - group.offset
             )
 
             # end offset within this group is the smaller of the total end row - the group start row
@@ -303,7 +362,7 @@ class DatetimeParquetDataset(ParquetDataset):
             # group.
             end_offset = (
                 len(self.pq_cache.df)
-                if total_idx != end_idx
+                if row_group_idx != end_row_group_idx
                 else end_segment.end_offset - group.offset
             )
 
@@ -316,4 +375,15 @@ class DatetimeParquetDataset(ParquetDataset):
             # `dtype` keyword in polars.
             df_list.append(torch.from_numpy(row_df.to_numpy()).float())
 
-        return torch.vstack(df_list)
+        # Get the number of rows per date/time and return the cumulative counts for indexing into
+        # the output tensors.
+        row_offsets: torch.Tensor = torch.from_numpy(
+            _get_cumulative_counts(
+                [
+                    segment.end_offset - segment.start_offset
+                    for segment in self.date_time_segments[start_idx : end_idx + 1]
+                ]
+            )
+        ).int()
+
+        return torch.vstack(df_list), row_offsets

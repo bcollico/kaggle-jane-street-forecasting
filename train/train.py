@@ -1,6 +1,8 @@
 from typing import Any, Dict, List, OrderedDict
 from collections import OrderedDict
 import tqdm
+from pathlib import Path
+import time
 
 import os
 import sys
@@ -17,7 +19,7 @@ from torchsummary import summary
 from attention_model.attention_model import TransformerModel
 from parquet_dataset.parquet_dataset import DatetimeParquetDataset
 
-K_TRAIN_INDICES = [0]  # , 1, 2, 3, 4, 5, 6, 7, 8]
+K_TRAIN_INDICES = [8] # 0, 1, 2, 3, 4, 5, 6, 7, 
 K_VAL_INDICES = [9]
 
 
@@ -38,7 +40,7 @@ def dict_to_cuda(sample: Dict[Any, torch.Tensor]) -> None:
 class ModelRunner:
     """Model running class for training."""
 
-    def __init__(self, num_epochs: int = 10, train_seq_len: int = 128) -> None:
+    def __init__(self, num_epochs: int = 10, train_seq_len: int = 64) -> None:
 
         self.num_epochs = num_epochs
         self.train_seq_len = train_seq_len
@@ -54,7 +56,7 @@ class ModelRunner:
 
         self.val_dataloader = self.create_dataloader(
             parquet_files=[make_parquet_path(i) for i in K_VAL_INDICES],
-            window_size=64,
+            window_size=1,
             batch_size=1,
             shuffle=False,
         )
@@ -85,7 +87,7 @@ class ModelRunner:
                 "time_ids": torch.randint(0, 1000, (1, seq_len)).long(),
                 "symbol_ids": torch.randint(0, 256, (1, seq_len)).long(),
                 "features": torch.randn((1, seq_len, 79)).float(),
-                "responders": torch.randn((1, seq_len, 9)).float(),
+                "lags": torch.randn((1, seq_len, 9)).float(),
             }
         )
 
@@ -93,10 +95,10 @@ class ModelRunner:
         """Run the model through the dataloader one full time."""
 
         seq_loss: torch.Tensor = torch.tensor(0.0).cuda()
-        per_responder_loss: torch.Tensor = torch.zeros((9), requires_grad=False)
+        per_responder_mae: torch.Tensor = torch.zeros((9), requires_grad=False)
         total_len: int = 0
 
-        for i, sample in tqdm.tqdm(enumerate(dataloader)):
+        for i, sample in tqdm.tqdm(enumerate(dataloader), total=len(dataloader)):
             # TODO for training, sample the dataloader to start at different dates so that the model
             # sees slightly different sequences on each epoch
 
@@ -108,15 +110,14 @@ class ModelRunner:
                 time_ids=sample["time_id"],
                 symbol_ids=sample["symbol_id"],
                 features=sample["features"],
-                responders=sample["responders"],
+                responders=sample["lags"],
             )
 
-            total_loss: torch.Tensor = self.loss(predictions, sample["responders"])
+            targets = torch.vstack((sample["lags"], sample["responders_t"]))
+
+            total_loss: torch.Tensor = self.loss(predictions, targets)
             total_len += predictions.shape[1]
             seq_loss += total_loss.mean()
-
-            # Sum to (n_responder_len,) shape and add to running total
-            per_responder_loss += total_loss.cpu().detach().sum(dim=(0, 1))
 
             if self.model.training and (i + 1) % self.train_seq_len == 0:
 
@@ -131,17 +132,20 @@ class ModelRunner:
                 seq_loss = seq_loss.zero_().detach()
 
                 total_len = 0
-                per_responder_loss.zero_()
+
+            elif not self.model.training:
+                # Sum to (n_responder_len,) shape and add to running total
+                per_responder_mae += (
+                    (sample["lags"] - predictions).abs().cpu().detach().sum(dim=(0, 1))
+                )
 
         if not self.model.training:
-            print(f"Mean responder error: {per_responder_loss / total_len}")
+            print(f"Mean responder error: {per_responder_mae / total_len}")
 
     def run(self) -> None:
         """Running training and eval."""
-        with torch.no_grad():
-                print("Running baseline validation epoch...")
-                self.model.eval()
-                self.run_epoch(dataloader=self.val_dataloader)
+        save_path = Path(f"ckpt/{time.time()}")
+        save_path.mkdir(parents=True, exist_ok=False)
 
         for i in range(self.num_epochs):
             print(f"Training epoch {i}...")
@@ -151,7 +155,19 @@ class ModelRunner:
             with torch.no_grad():
                 print(f"Validating epoch {i}")
                 self.model.eval()
+                # Create the full memory context of the training set
+                self.run_epoch(dataloader=self.train_dataloader)
+                # Validate on the held-out data.
                 self.run_epoch(dataloader=self.val_dataloader)
+
+            torch.save(
+                {
+                    "epoch": i,
+                    "state_dict": self.model.state_dict(),
+                    "optimizer": self.optimizer.state_dict(),
+                },
+                f=(save_path / f"{i}.pt").as_posix(),
+            )
 
     @staticmethod
     def create_dataloader(parquet_files: List[str], window_size: int, **kwargs) -> DataLoader:

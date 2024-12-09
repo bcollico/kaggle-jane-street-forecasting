@@ -162,6 +162,7 @@ cython_debug/
 #.idea/
 #
 
+ckpt/
 data/
 notes.md
 .vscode

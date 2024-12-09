@@ -193,79 +193,39 @@ class TransformerModel(torch.nn.Module):
             ]
         )
 
-    def reset_memory(self):
+    def reset_memory(self) -> None:
+        """Reset the memory matrices for each transformer block layer."""
         self.cross_attn_layer.attention.reset_memory()
+        layer: TransformerBlock
         for layer in self.layers:
             layer.attention.reset_memory()
 
     @staticmethod
-    def create_causal_masks(id_mat: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get the self and cross attention masks for the input sequence length. return masks that
-        do not allow for attention from a token to a token in the same row position as well as
-        a mask that does.
+    def create_causal_mask(id_mat_1: torch.Tensor, id_mat_2: torch.Tensor) -> torch.Tensor:
+        """Get the causal attention mask for the input sequence lengths. return a mask that
+        allows for attention between tokens with the same ID value or a lesser ID value.
 
-        E.g. id_mat = [1, 1, 2, 2, 2, 3]
+        E.g. id_mat_1 = [1, 1, 2, 2, 2, 3], id_mask_2 = [0, 1, 2, 2, 3]
 
-        cross attention mask (don't attend to rows with same ID.)
+        causal attention mask -- attend to rows with the same ID or less.
 
-        output =    [1, 1, 1, 1, 1, 1]
-                    [1, 1, 1, 1, 1, 1]
-                    [0, 0, 1, 1, 1, 1]
-                    [0, 0, 1, 1, 1, 1]
-                    [0, 0, 1, 1, 1, 1]
-                    [0, 0, 0, 0, 0, 1]
-
-        self attention mask (attend to rows with same ID or lesser IDs)
-
-        output =    [0, 0, 1, 1, 1, 1]
-                    [0, 0, 1, 1, 1, 1]
-                    [0, 0, 0, 0, 0, 1]
-                    [0, 0, 0, 0, 0, 1]
-                    [0, 0, 0, 0, 0, 1]
-                    [0, 0, 0, 0, 0, 0]
+        output = [False, False,  True,  True,  True],
+                 [False, False,  True,  True,  True],
+                 [False, False, False, False,  True],
+                 [False, False, False, False,  True],
+                 [False, False, False, False,  True],
+                 [False, False, False, False, False]]
 
         Args:
-            id_mat (torch.Tensor): Mask of ID values to use to create the mask. Items with the same
+            id_mat_1 (torch.Tensor): Mask of ID values to use to create the mask. Items with the same
                 ID can attend to each other. Items can attend to values with smaller ID values.
-                (..., seq_len, 1)
-            diag (bool): Flag whether to allow attention between a query and value at the same row
-                index. Set to false for attention between features and responders at the same time
-                to avoid data leakage.
+                (..., seq_len_1)
+            id_mat_2 (torch.Tensor): Mask of ID values to compare the first mask against.
 
         Returns:
-            self_attn_mask (torch.Tensor): Bool tensor with upper triangular set to True, including
-                diagonal. (..., seq_len, seq_len)
-            cross_attn_mask (torch.Tensor): Bool tensor with upper triangular set to True, excluding
-                diagonal. (..., seq_len, seq_len)
+            causal_mask (torch.Tensor): Bool tensor id_mat_1.T < id_mat_2, (1, seq_len_1, seq_len_2)
         """
-        mat: torch.Tensor = id_mat == id_mat.transpose(-1, -2)
-        cumsum: torch.Tensor = torch.cumsum(mat, dim=-1)
-        return (
-            (cumsum + torch.logical_not(mat) > mat.sum(dim=-2, keepdim=True)).unsqueeze(0),
-            cumsum.bool().unsqueeze(0),
-        )
-
-    def create_date_and_time_masks(
-        self, time_id: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get the causal attention masks taking into account the date and time IDs.
-
-        Args:
-            time_id (torch.Tensor): Time IDs (..., seq_len).
-            date_id (torch.Tensor): Date IDs (..., seq_len).
-
-        Returns:
-            self_attn_mask (torch.Tensor): Bool tensor with upper triangular set to True, including
-                diagonal. (..., seq_len, seq_len)
-            cross_attn_mask (torch.Tensor): Bool tensor with upper triangular set to True, excluding
-                diagonal. (..., seq_len, seq_len)
-        """
-        sa_mask_t, ca_mask_t = self.create_causal_masks(id_mat=time_id)
-        # TODO figure out if/how to mask on date + time and not just time. Assuming currently that
-        # it might be sufficient to mask on time alone when the window is small enough since the
-        # time id will wrap around from a large number to a small number when the sequence is
-        # split across days.
-        return sa_mask_t, ca_mask_t
+        return (id_mat_1.transpose(-1, -2) < id_mat_2).unsqueeze(0)
 
     def forward(
         self,
@@ -288,44 +248,54 @@ class TransformerModel(torch.nn.Module):
             symbol_ids (torch.Tensor): Integer values (batch_size, seq_len, 1) representing the
                 encrypted market ID of the time series. Used to retrieve a security-specific
                 embedding.
-            features (torch.Tensor): Input features (batch_size, seq_len, n_feature_len)
-            responders (torch.Tensor): Input lagged responders (batch_size, seq_len, n_responder_len)
-                where the feature vector `t` and responder vector `t` are paired. The responders
-                are masked in the forward pass so that the model doesn't get any "future"
-                information in the attention scores.
+            features (torch.Tensor): Input features (batch_size, features_seq_len, n_feature_len)
+                from dt_1 ... dt_n
+            responders (torch.Tensor): Input lagged responders from dt_0 .. dt_n-1.
+                (batch_size, responder_seq_len, n_responder_len) where the feature vector `t` and
+                responder vector `t` are paired. The responders are masked in the forward pass so
+                that the model doesn't get any "future" information in the attention scores.
 
         Returns:
             predicted_responders (torch.Tensor): (batch_size, seq_len, n_responder_len) responder
                 predictions.
         """
-        n_feature_len = features.shape[-1]
-        n_responder_len = responders.shape[-1]
 
-        assert n_responder_len == self.n_responder_len
-        assert n_feature_len == self.n_feature_len
+        # The responders and the features are not necessarily the same length since the responders
+        # are lagged by one date/time.
+        feature_seq_len = features.shape[-2]
+        responder_seq_len = responders.shape[-2]
 
         # Symbol and time embeddings use their absolute values.
-        symbol_emb = self.symbol_embedding(symbol_ids)
-        time_emb = self.time_embedding(time_ids)
+        # Date embedding uses value modulo 365 to hopefully capture long-term cyclical trends.
+        # Summed input embeddings. Consider trying to concat or append.
+        embedding = (
+            self.time_embedding(time_ids)
+            + self.date_embedding(date_ids % 365)
+            + self.symbol_embedding(symbol_ids)
+        )
 
-        # Date embedding uses a relative value to the start of this sequence since date is
-        # unbounded. TODO: try doing date_id % 365 so that it's bounded or (date_id % 365) % 12
-        # to get the long-term seasonal embeddings
-        date_emb = self.date_embedding(date_ids % 365)
-
-        # Create feature and responder embeddings.
-        feature_emb = self.feature_embedding(features)
-        responder_emb = self.responder_embedding(responders)
-
-        # Augment feature embedding with time, date, and symbol embeddings.
-        feature_emb = feature_emb + time_emb + date_emb + symbol_emb
+        # Create feature and responder embeddings. Index into the embedding to get the date/time
+        # information relevant for features and responders. The dates/times/symbols are provided
+        # in the same order (chronological + sequential by sequence ID) so that the
+        feature_emb = self.feature_embedding(features) + embedding[..., -feature_seq_len:, :]
+        responder_emb = self.responder_embedding(responders) + embedding[..., :responder_seq_len, :]
 
         # Create the masks for cross and self attention.
         with torch.no_grad():
-            self_attn_mask, cross_attn_mask = self.create_date_and_time_masks(time_id=time_ids)
+            # Cross attention mask is created by comparing the feature time IDs against the lagged
+            # time IDs (advanced by one index since we want the current t to attend to lags < t).
+            cross_attn_mask: torch.Tensor = self.create_causal_mask(
+                id_mat_1=time_ids[..., -feature_seq_len:],
+                id_mat_2=time_ids[..., :responder_seq_len] + 1,
+            )
+
+            # The self attention mask compares the feature Time IDs to themselves.
+            self_attn_mask: torch.Tensor = self.create_causal_mask(
+                id_mat_1=time_ids[..., -feature_seq_len:], id_mat_2=time_ids[..., -feature_seq_len:]
+            )
 
         # Cross attention between the features and their lagged responders.
-        out = self.cross_attn_layer.forward(x=responder_emb, y=feature_emb, mask=cross_attn_mask)
+        out = self.cross_attn_layer.forward(x=feature_emb, y=responder_emb, mask=cross_attn_mask)
 
         # Self attention layers.
         for layer in self.layers:
