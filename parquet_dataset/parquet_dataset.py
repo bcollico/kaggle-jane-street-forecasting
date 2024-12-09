@@ -302,11 +302,9 @@ class DatetimeParquetDataset(ParquetDataset):
         )
 
         return {
-            "row_offsets": row_offsets,
             "date_id": rows[:, 0].int(),
             "time_id": rows[:, 1].int(),
             "symbol_id": rows[:, 2].int(),
-            "weights": rows[:, 3],
             "features": rows[row_offsets[1] :, 4:83],
             "lags": rows[: row_offsets[-1], 83:92],
             "responders_t": rows[row_offsets[-1] :, 83:92],
@@ -353,7 +351,9 @@ class DatetimeParquetDataset(ParquetDataset):
             # If it's greater than zero, we need to discard some rows from the start of this row
             # group.
             start_offset = (
-                0 if row_group_idx != start_idx else start_segment.start_offset - group.offset
+                0
+                if row_group_idx != start_row_group_idx
+                else start_segment.start_offset - group.offset
             )
 
             # end offset within this group is the smaller of the total end row - the group start row
