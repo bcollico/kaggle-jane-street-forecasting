@@ -133,30 +133,27 @@ class TransformerModel(torch.nn.Module):
         )
 
         # Create embeddings for all possible uint8 symbols, most of these will not be updated, but
-        # to make the model extensible to new symbols let's allocate for more than we need.
+        # to make the model extensible to new symbols let's allocate enough for any 8-bit int ID.
         # Start embeddings at zero so that unseen embeddings have no contribution to the features.
         self.symbol_embedding = torch.nn.Embedding.from_pretrained(
             torch.zeros(256, d_model), freeze=False
         )
 
-        # Relative date embedding. Assume that we'll have a small window of potential date ranges
-        # for an input sample. E.g. input dim of 8 means that we can only span up to 8 days in an
-        # input sequence. We assume that intra-day trends will be captured via this embedding and
-        # seasonal trends via a memory mechanism. Perhaps this will have to be expanded to better
-        # generalize to sequences across many more days than we have here.
+        # Date embedding. Assume that Date IDs are consistent such that when we take modulus with
+        # 365 we get the same day of the year (potentially not correct due to leap year).
         self.date_embedding = torch.nn.Embedding.from_pretrained(
             torch.zeros(365, d_model), freeze=False
         )
 
         # Absolute time embedding. The training dataset has <1000 absolute time indices. It's
         # uncertain how I should be using these since the actual time between time_ids is not fixed,
-        # but we should use some form of absolute time embedding to capture inter-day trends.
+        # but we should use some form of absolute time embedding to capture intra-day trends.
         self.time_embedding = torch.nn.Embedding.from_pretrained(
             torch.zeros(1000, d_model), freeze=False
         )
 
         # Positional encoding var.
-        self.rope = RotaryPositionalEncoding(d_model=d_model)
+        self.rope = RotaryPositionalEncoding(d_model=d_model, enable_sin_cos_caching=True)
 
         self.out_norm = torch.nn.LayerNorm(d_model)
         self.logit_linear = torch.nn.Linear(in_features=d_model, out_features=n_responder_len)
@@ -287,12 +284,12 @@ class TransformerModel(torch.nn.Module):
             cross_attn_mask: torch.Tensor = self.create_causal_mask(
                 id_mat_1=time_ids[..., -feature_seq_len:],
                 id_mat_2=time_ids[..., :responder_seq_len] + 1,
-            )
+            ).unsqueeze(1)
 
             # The self attention mask compares the feature Time IDs to themselves.
             self_attn_mask: torch.Tensor = self.create_causal_mask(
                 id_mat_1=time_ids[..., -feature_seq_len:], id_mat_2=time_ids[..., -feature_seq_len:]
-            )
+            ).unsqueeze(1)
 
         # Cross attention between the features and their lagged responders.
         out = self.cross_attn_layer.forward(x=feature_emb, y=responder_emb, mask=cross_attn_mask)

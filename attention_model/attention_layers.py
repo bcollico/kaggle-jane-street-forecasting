@@ -243,37 +243,40 @@ class GroupedQueryAttention(torch.nn.Module):
         n_b, n_seq_q = query.shape[:2]
         n_seq_kv = key.shape[-2]
 
-        # TODO: figure out how to remove the `repeat_interleave` here to compute the
-        # grouped attention without copying the key and value data.
+        # (n_b, n_head, d_head, n_seq_q)
+        key_t = key.view(n_b, n_seq_kv, self.n_head, self.d_head).permute(0, 2, 3, 1)
 
-        # (n_b, n_head * n_query, d_head, n_seq_q)
-        key_t = (
-            key.view(n_b, n_seq_kv, self.n_head, self.d_head)
-            .repeat_interleave(self.n_query, -2)
-            .permute(0, 2, 3, 1)
-        )
-
-        # (n_b, n_query * n_head, n_seq_q, d_head)
-        query_t = query.view(n_b, n_seq_q, self.n_query * self.n_head, self.d_head).transpose(1, 2)
-
-        # (n_b, n_query * n_head, n_seq_q, d_head)
-        value_t = (
-            value.view(n_b, n_seq_kv, self.n_head, self.d_head)
-            .repeat_interleave(self.n_query, -2)
+        # (n_b, n_head, n_query * n_seq_q, d_head)
+        query_t = (
+            query.view(n_b, n_seq_q, self.n_head * self.n_query, self.d_head)
             .transpose(1, 2)
+            .reshape(n_b, self.n_head, self.n_query * n_seq_q, self.d_head)
         )
 
-        # (n_b, n_query * n_head, n_seq_q, n_seq_q)
-        attention_scores = query_t @ key_t * self.attention_scale
+        # (n_b, n_head, n_seq_kv, d_head)
+        value_t = value.view(n_b, n_seq_kv, self.n_head, self.d_head).transpose(1, 2)
+
+        # (n_b, n_head , n_query * n_seq_q, n_seq_q)
+        attention_scores = (query_t @ key_t * self.attention_scale).view(
+            n_b, self.n_head * self.n_query, n_seq_q, n_seq_kv
+        )
 
         if mask is not None:
             attention_scores = torch.masked_fill(attention_scores, mask, value=-1e9)
         attention_probabilities = torch.nn.functional.softmax(attention_scores, dim=-1)
 
-        attention_probabilities = attention_probabilities * torch.logical_not(mask)
+        if mask is not None:
+            attention_probabilities = torch.masked_fill(attention_probabilities, mask, 0.0)
 
-        # (n_b, n_query * n_head, n_seq_q, d_head) -> (n_b, n_seq_q, n_query * n_head, d_head)
-        return (self.attn_dropout(attention_probabilities) @ value_t).transpose(1, 2)
+        # (n_b, n_query * n_head, n_seq_q, d_head) -> (n_b, n_head, n_query * n_seq_q, d_head)
+        attention_probabilities = self.attn_dropout(attention_probabilities)
+        attention_out = (
+            attention_probabilities.view(n_b, self.n_head, self.n_query * n_seq_q, n_seq_kv)
+            @ value_t
+        )
+        return attention_out.view(n_b, self.n_head * self.n_query, n_seq_q, self.d_head).transpose(
+            1, 2
+        )
 
     def kqv(
         self, k: torch.Tensor, q: torch.Tensor, v: torch.Tensor

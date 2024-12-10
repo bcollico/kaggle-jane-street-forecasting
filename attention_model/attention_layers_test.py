@@ -57,7 +57,9 @@ class TestGRMHA(unittest.TestCase):
         self.layer.memory_norm.random_()
 
         # Calculate using layer
-        layer_attention_mem = self.layer.calculate_memory_attention(query)
+        layer_attention_mem = self.layer.calculate_memory_attention(
+            query=query, memory=self.layer.memory, memory_norm=self.layer.memory_norm
+        )
 
         # Check the output shape.
         self.assertEqual(
@@ -91,7 +93,9 @@ class TestGRMHA(unittest.TestCase):
         """Simple test to check that the memory update function still runs."""
         key = torch.randn(self.batch_size, self.seq_len, self.d_head * self.n_head)
         value = torch.randn(self.batch_size, self.seq_len, self.d_head * self.n_head)
-        self.layer.update_memory(key=key, value=value)
+        self.layer.update_memory(
+            key=key, value=value, memory=self.layer.memory, memory_norm=self.layer.memory_norm
+        )
 
     def test_should_run_forward(self):
         """Simple test to check that the memory update function still runs."""
