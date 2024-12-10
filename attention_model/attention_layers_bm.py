@@ -17,13 +17,13 @@ from attention_model.attention_layers import (
     RotaryPositionalEncoding,
 )
 
-N_RUNS = 1000
+N_RUNS = 100
 
-N_QUERY = 8
+N_QUERY = 4
 N_HEAD = 4
-D_HEAD = 64
-SEQ_LEN = 200
-BATCH_SIZE = 10
+D_HEAD = 32
+SEQ_LEN = 6000
+BATCH_SIZE = 1
 
 D_MODEL = N_QUERY * N_HEAD * D_HEAD
 
@@ -70,14 +70,13 @@ def run_custom_layer():
 
     # Instantiating and pre-computing the rope object does not change the
     # timing compared to letting the layer instantiate it's own rope.
-    rope = RotaryPositionalEncoding(d_model=D_MODEL, device=key.device)
-
-    rope.forward(x=query)
+    rope = RotaryPositionalEncoding(d_model=D_MODEL, device=key.device, enable_sin_cos_caching=True)
 
     layer = InfiniGroupedQueryAttention(
         d_model=D_MODEL,
         n_query=N_QUERY,
         n_head=N_HEAD,
+        rope=rope,
     ).cuda()
 
     layer_time = bm.Timer(
@@ -88,15 +87,14 @@ def run_custom_layer():
     print(layer_time.timeit(N_RUNS))
 
 
-def run_rope():
+def run_rope(enable_cache: bool):
     """Benchmark the positional encoding forward pass by itself."""
     query = torch.randn(BATCH_SIZE, SEQ_LEN, D_MODEL).cuda()
     key = torch.randn(BATCH_SIZE, SEQ_LEN, D_HEAD * N_HEAD).cuda()
 
-    # Instantiating and pre-computing the rope object does not change the
-    # timing compared to letting the layer instantiate it's own rope.
-    rope = RotaryPositionalEncoding(d_model=D_MODEL, device=key.device)
-    rope.forward(query)
+    rope = RotaryPositionalEncoding(
+        d_model=D_MODEL, device=key.device, enable_sin_cos_caching=enable_cache
+    )
 
     rope_time = bm.Timer(
         stmt="rope.forward(x=query), rope.forward(x=key)",
@@ -118,21 +116,27 @@ def run_attention_layers_bm():
 
     See https://pytorch.org/tutorials/recipes/recipes/benchmark.html for details.
 
-    Last results:
-    rope.forward(x=query), rope.forward(x=key)
-        16.24 ms
-        1 measurement, 1000 runs , 1 thread
-    torch.nn.functional.scaled_dot_product_attention(query=q, key=k, value=v, enable_gqa=True)
-        16.81 ms
-        1 measurement, 1000 runs , 1 thread
-    layer.scaled_dot_product_attention(query=query, key=key, value=value)
-        16.95 ms
-        1 measurement, 1000 runs , 1 thread
+    RoPE caching gives an 18% speedup, but only a fraction of a ms absolute speedup.
+        rope.forward(x=query), rope.forward(x=key) without caching
+            984.0 us
+            1 measurement, 100 runs , 1 thread
+        rope.forward(x=query), rope.forward(x=key) with caching
+            803.7 us
+            1 measurement, 100 runs , 1 thread
+
+    Custom grouped query attention gives a 17.3% speedup over the torch implementation! (With extra
+    calculations for the memory attention)
+        torch.nn.functional.scaled_dot_product_attention(query=q, key=k, value=v, enable_gqa=True)
+            78.3 ms
+            1 measurement, 1000 runs , 1 thread
+        layer.scaled_dot_product_attention(query=query, key=key, value=value)
+            64.78 ms
+            1 measurement, 1000 runs , 1 thread
 
     NB: you get a speedup of about 25% by using torch.compile to optimize the SDPA functions.
     """
-
-    run_rope()
+    run_rope(enable_cache=False)
+    run_rope(enable_cache=True)
     run_torch_scaled_attention()
     run_custom_layer()
 

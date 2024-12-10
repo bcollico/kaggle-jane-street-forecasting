@@ -19,7 +19,7 @@ from torchsummary import summary
 from attention_model.attention_model import TransformerModel
 from parquet_dataset.parquet_dataset import DatetimeParquetDataset
 
-K_TRAIN_INDICES = [8] # 0, 1, 2, 3, 4, 5, 6, 7, 
+K_TRAIN_INDICES = [8]  # 0, 1, 2, 3, 4, 5, 6, 7,
 K_VAL_INDICES = [9]
 
 
@@ -40,7 +40,7 @@ def dict_to_cuda(sample: Dict[Any, torch.Tensor]) -> None:
 class ModelRunner:
     """Model running class for training."""
 
-    def __init__(self, num_epochs: int = 10, train_seq_len: int = 64) -> None:
+    def __init__(self, num_epochs: int = 1000, train_seq_len: int = 1) -> None:
 
         self.num_epochs = num_epochs
         self.train_seq_len = train_seq_len
@@ -54,9 +54,12 @@ class ModelRunner:
 
         self.log_dataloader_info(self.train_dataloader, mode="train")
 
+        # At true evaluation time, the window size will be 1, but it's pretty slow to eval with a
+        # window size of 1 during training, so set to 64 to capture the general trends (or maybe
+        # I should just limit the length of this dataloader.)
         self.val_dataloader = self.create_dataloader(
             parquet_files=[make_parquet_path(i) for i in K_VAL_INDICES],
-            window_size=1,
+            window_size=64,
             batch_size=1,
             shuffle=False,
         )
@@ -94,11 +97,14 @@ class ModelRunner:
     def run_epoch(self, dataloader: DataLoader) -> None:
         """Run the model through the dataloader one full time."""
 
+        # Always reset the memory before running an epoch
+        self.model.reset_memory()
+
         seq_loss: torch.Tensor = torch.tensor(0.0).cuda()
         per_responder_mae: torch.Tensor = torch.zeros((9), requires_grad=False)
         total_len: int = 0
 
-        for i, sample in tqdm.tqdm(enumerate(dataloader), total=len(dataloader)):
+        for i, sample in enumerate(dataloader):
             # TODO for training, sample the dataloader to start at different dates so that the model
             # sees slightly different sequences on each epoch
 
@@ -113,14 +119,20 @@ class ModelRunner:
                 responders=sample["lags"],
             )
 
-            targets = torch.vstack((sample["lags"], sample["responders_t"]))
+            # Get the targets only for the predictions -- discard the lagged responders from the
+            # time step before the first feature input and append the responders at the last
+            # feature input.
+            targets = torch.cat((sample["lags"], sample["responders_t"]), dim=-2)[
+                ..., -predictions.shape[-2] :, :
+            ]
 
             total_loss: torch.Tensor = self.loss(predictions, targets)
             total_len += predictions.shape[1]
             seq_loss += total_loss.mean()
+            print(total_loss.mean())
 
             if self.model.training and (i + 1) % self.train_seq_len == 0:
-
+                print(seq_loss / self.train_seq_len)
                 seq_loss.backward()
 
                 self.optimizer.step()
@@ -132,12 +144,11 @@ class ModelRunner:
                 seq_loss = seq_loss.zero_().detach()
 
                 total_len = 0
+                break
 
             elif not self.model.training:
                 # Sum to (n_responder_len,) shape and add to running total
-                per_responder_mae += (
-                    (sample["lags"] - predictions).abs().cpu().detach().sum(dim=(0, 1))
-                )
+                per_responder_mae += (targets - predictions).abs().cpu().detach().sum(dim=(0, 1))
 
         if not self.model.training:
             print(f"Mean responder error: {per_responder_mae / total_len}")
@@ -156,7 +167,7 @@ class ModelRunner:
                 print(f"Validating epoch {i}")
                 self.model.eval()
                 # Create the full memory context of the training set
-                self.run_epoch(dataloader=self.train_dataloader)
+                # self.run_epoch(dataloader=self.train_dataloader)
                 # Validate on the held-out data.
                 self.run_epoch(dataloader=self.val_dataloader)
 
@@ -185,12 +196,12 @@ class ModelRunner:
             n_feature_len=79,
             n_responder_len=9,
             n_query=4,
-            n_head=4,
-            d_model=512,
+            n_head=1,
+            d_model=256,
         ).cuda()
 
     @staticmethod
-    def create_optimizer(model: torch.nn.Module, lr: float = 0.0001) -> torch.optim.Optimizer:
+    def create_optimizer(model: torch.nn.Module, lr: float = 0.001) -> torch.optim.Optimizer:
         """Create the optimizer"""
         return torch.optim.AdamW(
             params=model.parameters(),

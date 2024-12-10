@@ -119,19 +119,18 @@ class RotaryPositionalEncoding(torch.nn.Module):
         seq_len, d_model = x.shape[-2], x.shape[-1]
         d_model_2: int = int(d_model / 2)
 
-        with torch.no_grad():
-            if self.use_cache:
-                self._allocate_sin_cos(seq_len=seq_len)
+        if self.use_cache:
+            self._allocate_sin_cos(seq_len=seq_len)
 
-                self.sin_pos = self.sin_pos.to(x.device)
-                self.cos_pos = self.cos_pos.to(x.device)
+            self.sin_pos = self.sin_pos.to(x.device)
+            self.cos_pos = self.cos_pos.to(x.device)
 
-                cos_pos: torch.Tensor = self.cos_pos[:seq_len, :d_model_2]
-                sin_pos: torch.Tensor = self.sin_pos[:seq_len, :d_model_2]
-            else:
-                cos_pos, sin_pos = self._calc_sin_cos_mats(
-                    start=0, end=seq_len, d_model_2=d_model_2, device=x.device
-                )
+            cos_pos: torch.Tensor = self.cos_pos[:seq_len, :d_model_2]
+            sin_pos: torch.Tensor = self.sin_pos[:seq_len, :d_model_2]
+        else:
+            cos_pos, sin_pos = self._calc_sin_cos_mats(
+                start=0, end=seq_len, d_model_2=d_model_2, device=x.device
+            )
 
         x_even, x_odd = x[..., ::2], x[..., 1::2]
 

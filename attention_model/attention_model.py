@@ -135,20 +135,31 @@ class TransformerModel(torch.nn.Module):
         # Create embeddings for all possible uint8 symbols, most of these will not be updated, but
         # to make the model extensible to new symbols let's allocate enough for any 8-bit int ID.
         # Start embeddings at zero so that unseen embeddings have no contribution to the features.
-        self.symbol_embedding = torch.nn.Embedding.from_pretrained(
+        self.symbol_embedding_f = torch.nn.Embedding.from_pretrained(
             torch.zeros(256, d_model), freeze=False
         )
 
         # Date embedding. Assume that Date IDs are consistent such that when we take modulus with
         # 365 we get the same day of the year (potentially not correct due to leap year).
-        self.date_embedding = torch.nn.Embedding.from_pretrained(
+        self.date_embedding_f = torch.nn.Embedding.from_pretrained(
             torch.zeros(365, d_model), freeze=False
         )
 
         # Absolute time embedding. The training dataset has <1000 absolute time indices. It's
         # uncertain how I should be using these since the actual time between time_ids is not fixed,
         # but we should use some form of absolute time embedding to capture intra-day trends.
-        self.time_embedding = torch.nn.Embedding.from_pretrained(
+        self.time_embedding_f = torch.nn.Embedding.from_pretrained(
+            torch.zeros(1000, d_model), freeze=False
+        )
+
+        # Create separate embedding layers for the responders.
+        self.symbol_embedding_r = torch.nn.Embedding.from_pretrained(
+            torch.zeros(256, d_model), freeze=False
+        )
+        self.date_embedding_r = torch.nn.Embedding.from_pretrained(
+            torch.zeros(365, d_model), freeze=False
+        )
+        self.time_embedding_r = torch.nn.Embedding.from_pretrained(
             torch.zeros(1000, d_model), freeze=False
         )
 
@@ -265,17 +276,22 @@ class TransformerModel(torch.nn.Module):
         # Symbol and time embeddings use their absolute values.
         # Date embedding uses value modulo 365 to hopefully capture long-term cyclical trends.
         # Summed input embeddings. Consider trying to concat or append.
-        embedding = (
-            self.time_embedding(time_ids)
-            + self.date_embedding(date_ids % 365)
-            + self.symbol_embedding(symbol_ids)
+        f_embedding = (
+            self.time_embedding_f(time_ids[..., -feature_seq_len:])
+            + self.date_embedding_f(date_ids[..., -feature_seq_len:] % 365)
+            + self.symbol_embedding_f(symbol_ids[..., -feature_seq_len:])
+        )
+        r_embedding = (
+            self.time_embedding_r(time_ids[..., :responder_seq_len])
+            + self.date_embedding_r(date_ids[..., :responder_seq_len] % 365)
+            + self.symbol_embedding_r(symbol_ids[..., :responder_seq_len])
         )
 
         # Create feature and responder embeddings. Index into the embedding to get the date/time
         # information relevant for features and responders. The dates/times/symbols are provided
         # in the same order (chronological + sequential by sequence ID) so that the
-        feature_emb = self.feature_embedding(features) + embedding[..., -feature_seq_len:, :]
-        responder_emb = self.responder_embedding(responders) + embedding[..., :responder_seq_len, :]
+        feature_emb = self.feature_embedding(features) + f_embedding
+        responder_emb = self.responder_embedding(responders) + r_embedding
 
         # Create the masks for cross and self attention.
         with torch.no_grad():
@@ -286,13 +302,14 @@ class TransformerModel(torch.nn.Module):
                 id_mat_2=time_ids[..., :responder_seq_len] + 1,
             ).unsqueeze(1)
 
+        # Cross attention between the features and their lagged responders.
+        out = self.cross_attn_layer.forward(x=feature_emb, y=responder_emb, mask=cross_attn_mask)
+
+        with torch.no_grad():
             # The self attention mask compares the feature Time IDs to themselves.
             self_attn_mask: torch.Tensor = self.create_causal_mask(
                 id_mat_1=time_ids[..., -feature_seq_len:], id_mat_2=time_ids[..., -feature_seq_len:]
             ).unsqueeze(1)
-
-        # Cross attention between the features and their lagged responders.
-        out = self.cross_attn_layer.forward(x=feature_emb, y=responder_emb, mask=cross_attn_mask)
 
         # Self attention layers.
         for layer in self.layers:
