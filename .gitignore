@@ -162,6 +162,7 @@ cython_debug/
 #.idea/
 #
 
+data_analysis/plots
 ckpt/
 data/
 notes.md
