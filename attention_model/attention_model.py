@@ -1,6 +1,6 @@
 """Transformer block and full model definitions"""
 
-from typing import Optional, Tuple
+from typing import Optional
 from copy import deepcopy
 import torch
 from attention_model.attention_layers import (
@@ -136,31 +136,43 @@ class TransformerModel(torch.nn.Module):
         # to make the model extensible to new symbols let's allocate enough for any 8-bit int ID.
         # Start embeddings at zero so that unseen embeddings have no contribution to the features.
         self.symbol_embedding_f = torch.nn.Embedding.from_pretrained(
-            torch.zeros(256, d_model), freeze=False
+            torch.normal(mean=0.0, std=0.1, size=(256, d_model)),
+            freeze=False,
+            scale_grad_by_freq=True,
         )
 
         # Date embedding. Assume that Date IDs are consistent such that when we take modulus with
         # 365 we get the same day of the year (potentially not correct due to leap year).
         self.date_embedding_f = torch.nn.Embedding.from_pretrained(
-            torch.zeros(365, d_model), freeze=False
+            torch.normal(mean=0.0, std=0.1, size=(365, d_model)),
+            freeze=False,
+            scale_grad_by_freq=True,
         )
 
         # Absolute time embedding. The training dataset has <1000 absolute time indices. It's
         # uncertain how I should be using these since the actual time between time_ids is not fixed,
         # but we should use some form of absolute time embedding to capture intra-day trends.
         self.time_embedding_f = torch.nn.Embedding.from_pretrained(
-            torch.zeros(1000, d_model), freeze=False
+            torch.normal(mean=0.0, std=0.1, size=(1000, d_model)),
+            freeze=False,
+            scale_grad_by_freq=True,
         )
 
         # Create separate embedding layers for the responders.
         self.symbol_embedding_r = torch.nn.Embedding.from_pretrained(
-            torch.zeros(256, d_model), freeze=False
+            torch.normal(mean=0.0, std=0.1, size=(256, d_model)),
+            freeze=False,
+            scale_grad_by_freq=True,
         )
         self.date_embedding_r = torch.nn.Embedding.from_pretrained(
-            torch.zeros(365, d_model), freeze=False
+            torch.normal(mean=0.0, std=0.1, size=(365, d_model)),
+            freeze=False,
+            scale_grad_by_freq=True,
         )
         self.time_embedding_r = torch.nn.Embedding.from_pretrained(
-            torch.zeros(1000, d_model), freeze=False
+            torch.normal(mean=0.0, std=0.1, size=(1000, d_model)),
+            freeze=False,
+            scale_grad_by_freq=True,
         )
 
         # Positional encoding var.
@@ -319,5 +331,8 @@ class TransformerModel(torch.nn.Module):
 
         # Predict the responder variables.
         predictions = self.logit_linear(out_norm)
+
+        # Clamp the predictions to [-5, 5].
+        torch.clamp(predictions, min=-5.0, max=5.0)
 
         return predictions
