@@ -294,10 +294,11 @@ class DatetimeParquetDataset(ParquetDataset):
                 for indexing each date/time individually.
 
         """
+
         idx = idx * self.time_context_length + self.time_context_length
 
         rows, row_offsets = self._get_dt_sample_range(
-            start_idx=max(0, idx - self.time_context_length - 1),
+            start_idx=max(0, idx - self.time_context_length),
             end_idx=min(len(self.date_time_segments) - 1, idx),
         )
 
