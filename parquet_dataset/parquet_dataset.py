@@ -166,6 +166,7 @@ class ParquetDataset(Dataset):
             file_idx=file_idx,
             row_group_idx=row_group_idx,
             df=None,
+            df_mask=None,
         )
 
         # Load the file or row group.
@@ -174,7 +175,7 @@ class ParquetDataset(Dataset):
         else:
             self.pq_cache.df = pl.read_parquet(f)
 
-        # Simple data cleaning.
+        # Simple data cleaning. Replace NaN/Null with 0.
         # TODO: Replace with a better strategy for handling missing data.
         self.pq_cache.df = self.pq_cache.df.fill_nan(0.0).fill_null(0.0)
 

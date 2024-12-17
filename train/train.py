@@ -126,10 +126,13 @@ class ModelRunner:
                 ..., -predictions.shape[-2] :, :
             ]
 
+            # Compute the loss, masking the responders that are NaN or Null for computing the Loss
             total_loss: torch.Tensor = self.loss(predictions, targets)
-            total_len += predictions.shape[1]
             seq_loss += total_loss.mean()
-            print(total_loss.mean())
+
+            # Add to the total length (in terms of DF rows processed) for this
+            # sequence.
+            total_len += predictions.shape[1]
 
             if self.model.training and (i + 1) % self.train_seq_len == 0:
                 print(seq_loss / self.train_seq_len)
@@ -138,9 +141,8 @@ class ModelRunner:
                 self.optimizer.step()
                 self.optimizer.zero_grad()
 
-                # Reset the model memory matrices for the next sequence.
+                # Reset the model memory matrices and loss for the next sequence.
                 self.model.reset_memory()
-
                 seq_loss = seq_loss.zero_().detach()
 
                 total_len = 0
