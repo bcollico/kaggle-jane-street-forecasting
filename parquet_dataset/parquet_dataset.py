@@ -166,7 +166,6 @@ class ParquetDataset(Dataset):
             file_idx=file_idx,
             row_group_idx=row_group_idx,
             df=None,
-            df_mask=None,
         )
 
         # Load the file or row group.
