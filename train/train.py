@@ -51,38 +51,6 @@ K_FEATURE_LAMBDAS = [
 # fmt: on
 
 
-class GradientMonitor:
-    def __init__(self, model):
-        self.model = model
-        self.grad_norms = {}
-        # self.register_hooks()
-
-    # def register_hooks(self):
-    #     for name, param in self.model.named_parameters():
-    #         param.register_hook(lambda grad, name=name: self.record_grad_norm(name, grad))
-
-    # def record_grad_norm(self, name, grad):
-    #     self.grad_norms[name] = grad.norm().item()
-
-    def print_gradient_report(self):
-        for name, param in self.model.named_parameters():
-            self.grad_norms[name] = param.grad.norm().item()
-
-        print_summary = False
-        # Detect potential issues
-        norms = list(self.grad_norms.values())
-        if any(norm > 1000 for norm in norms):
-            print_summary = True
-            print("WARNING: Potential Exploding Gradients")
-        if any(norm < 1e-6 for norm in norms):
-            print_summary = True
-            print("WARNING: Potential Vanishing Gradients")
-
-        if print_summary:
-            for name, norm in self.grad_norms.items():
-                print(f"{name}: {norm}")
-
-
 def make_parquet_path(i: int) -> str:
     """Create a string path to a parquet file."""
     return (
@@ -97,29 +65,79 @@ def dict_to_cuda(sample: Dict[Any, torch.Tensor]) -> None:
         sample[k] = v.cuda()
 
 
+# def pad_and_unsqueeze(tensor: torch.Tensor, desired_len: int) -> torch.Tensor:
+#     """Pad and unsqueeze 1D and 2D tensors to prepare for concat along batch dimension."""
+#     # Set the padding shape
+#     pad_len = desired_len - tensor.shape[0]
+#     pad = (0, 0, pad_len, 0) if len(tensor.shape) == 2 else (pad_len, 0)
+
+#     # Pad the 1D tensors (integer values) with -1, pad the 2D tensors (features/responders) to 0.0
+#     value = -1 if len(tensor.shape) == 1 else 0
+
+#     return torch.nn.functional.pad(tensor, pad=pad, mode="constant", value=value).unsqueeze(0)
+
+
+# def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+#     """Collate the dictionary batches by padding each tensor and concatenating on new batch
+#     dimension."""
+#     max_len: int = 0
+#     for item in batch:
+#         max_len = max(item["date_id"].numel(), max_len)
+
+#     # Prepare the first sample to be the base for the rest of the batch.
+#     base = batch[0]
+#     for k, v in base.items():
+#         base[k] = pad_and_unsqueeze(tensor=v, desired_len=max_len)
+
+#     for sample in batch[1:]:
+#         for k, v in sample.items():
+#             # Concat the new tensor into the base for this batch.
+#             base[k] = torch.concat(
+#                 (base[k], pad_and_unsqueeze(tensor=sample[k], desired_len=max_len))
+#             )
+
+#             # Free the memory for this sample.
+#             sample[k] = None
+
+#     return base
+
+
 class ModelRunner:
     """Model running class for training."""
 
-    def __init__(self, num_epochs: int = 500, train_seq_len: int = 128) -> None:
+    def __init__(self, num_epochs: int = 100, train_seq_len: int = 32) -> None:
 
         self.num_epochs = num_epochs
         self.train_seq_len = train_seq_len
+
+        # Tensor for weighting the elements of the responder loss.
+        # Normalized to sum to 1.0.
+        self.loss_responder_weighting = torch.tensor(
+            [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        ).cuda()
+        self.loss_responder_weighting = torch.div(
+            self.loss_responder_weighting, self.loss_responder_weighting.sum()
+        )
+        print(f"Loss weighting: {self.loss_responder_weighting}")
 
         self.train_dataloader: DataLoader = self.create_dataloader(
             parquet_files=[make_parquet_path(i) for i in K_TRAIN_INDICES],
             window_size=32,
             batch_size=1,
             shuffle=False,
+            # collate_fn=collate_fn,
         )
 
         self.log_dataloader_info(self.train_dataloader, mode="train")
 
-        # At true evaluation time, the window size will be 1, but it's pretty slow to eval with a
-        # window size of 1 during training, so set to 64 to capture the general trends (or maybe
-        # I should just limit the length of this dataloader.)
+        # TODO(Bradley) Figure out how to properly do eval so that it doesn't take forever
+        # but is also representative of the actual eval conditions. I think we should
+        # be able to form sequences of the training length by grabbing the training data
+        # and then concatenating it with the first eval time step and marching forward
+        # from there.
         self.val_dataloader = self.create_dataloader(
             parquet_files=[make_parquet_path(i) for i in K_VAL_INDICES],
-            window_size=64,
+            window_size=32,
             batch_size=1,
             shuffle=False,
         )
@@ -136,14 +154,15 @@ class ModelRunner:
         )
 
         self.optimizer = self.create_optimizer(self.model)
-        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        self.lr_scheduler = torch.optim.lr_scheduler.CyclicLR(
             optimizer=self.optimizer,
-            T_max=self.num_epochs,  # * len(self.train_dataloader) / 10
-            eta_min=self.optimizer.param_groups[0]["lr"] / 10.0,
+            base_lr=self.optimizer.param_groups[0]["lr"],
+            max_lr=self.optimizer.param_groups[0]["lr"] * 10.0,
+            step_size_up=len(self.train_dataloader) / 2.6,
+            step_size_down=len(self.train_dataloader) / 2.6,
         )
 
         self.loss = torch.nn.SmoothL1Loss(reduction="none")
-        self.monitor = GradientMonitor(model=self.model)
         self.yeo_johnson_lambdas: torch.Tensor = torch.tensor(K_FEATURE_LAMBDAS)
 
     @staticmethod
@@ -157,22 +176,25 @@ class ModelRunner:
                 "time_ids": torch.randint(0, 1000, (1, seq_len)).long(),
                 "symbol_ids": torch.randint(0, 256, (1, seq_len)).long(),
                 "features": torch.randn((1, seq_len, 79)).float(),
-                "lags": torch.randn((1, seq_len, 9)).float(),
+                "responders": torch.randn((1, seq_len, 9)).float(),
             }
         )
 
     def run_epoch(self, dataloader: DataLoader) -> None:
         """Run the model through the dataloader one full time."""
 
-        # Always reset the memory before running an epoch
+        # Reset the memory before running an epoch.
         self.model.reset_memory()
+        self.optimizer.zero_grad()
 
-        seq_loss: torch.Tensor = torch.tensor(0.0).cuda()
+        seq_loss: torch.Tensor = torch.zeros(9).cuda()
+        epoch_loss: torch.Tensor = torch.zeros((9), requires_grad=False)
         per_responder_mae: torch.Tensor = torch.zeros((9), requires_grad=False)
-        total_len: int = 0
 
-        # for i, sample in tqdm.tqdm(enumerate(dataloader), total=len(dataloader)):
-        for i, sample in enumerate(dataloader):
+        total_len: int = 0
+        num_rows_per_sequence: int = 0
+
+        for i, sample in tqdm.tqdm(enumerate(dataloader), total=len(dataloader)):
             # TODO for training, sample the dataloader to start at different dates so that the model
             # sees slightly different sequences on each epoch
 
@@ -181,7 +203,6 @@ class ModelRunner:
 
             with torch.no_grad():
                 transformed_features = self.yeo_johnson_transform(sample["features"])
-                # transformed_features = sample["features"]
 
             predictions = self.model.forward(
                 date_ids=sample["date_id"],
@@ -198,26 +219,37 @@ class ModelRunner:
                 ..., -predictions.shape[-2] :, :
             ]
 
-            # Compute the loss, masking the responders that are NaN or Null for computing the Loss
+            # Compute the loss as the mean of mean of the sequence.
             total_loss: torch.Tensor = self.loss(predictions, targets)
-            seq_loss += total_loss.mean()
+
+            # Add the total responder vector to the sequence loss.
+            seq_loss += total_loss.sum((0, 1))
 
             # Add to the total length (in terms of DF rows processed) for this
             # sequence.
-            total_len += predictions.shape[1]
+            total_len += predictions.shape[1] * predictions.shape[0]
+            num_rows_per_sequence += predictions.shape[1] * predictions.shape[0]
+
+            # Sum to (n_responder_len,) shape and add to running total
+            per_responder_mae += (targets - predictions).abs().sum(dim=(0, 1)).cpu().detach()
 
             if self.model.training and (i + 1) % self.train_seq_len == 0:
+                print("backwards...")
+                # Divide the total responder vector by the total number of predicted elements
+                # to get the mean responder vector for this sequence.
+                seq_loss = torch.div(seq_loss, num_rows_per_sequence)
+                epoch_loss += seq_loss.detach().cpu()
+                total_seq_loss = (seq_loss * self.loss_responder_weighting).sum()
                 print(
-                    f"Train Loss: {(seq_loss / self.train_seq_len).item()}, "
+                    f"Train Loss: {(seq_loss)}, {total_seq_loss.item()}, "
                     f"LR: {self.optimizer.param_groups[0]['lr']}"
                 )
 
-                seq_loss.backward()
+                total_seq_loss.backward()
 
+                # Clip gradients per group.
                 for _, param in self.model.named_parameters():
-                    torch.nn.utils.clip_grad_norm_(parameters=param, max_norm=0.5)
-
-                self.monitor.print_gradient_report()
+                    torch.nn.utils.clip_grad_norm_(parameters=param, max_norm=1.0)
 
                 self.optimizer.step()
                 self.lr_scheduler.step()
@@ -225,47 +257,68 @@ class ModelRunner:
 
                 # Reset the model memory matrices and loss for the next sequence.
                 self.model.reset_memory()
-                seq_loss = seq_loss.zero_().detach()
-
-                total_len = 0
-                break
-
-            elif not self.model.training:
-                # Sum to (n_responder_len,) shape and add to running total
-                per_responder_mae += (targets - predictions).abs().cpu().detach().sum(dim=(0, 1))
+                seq_loss.zero_().detach_()
+                num_rows_per_sequence = 0
 
         if not self.model.training:
+            epoch_loss = torch.div(seq_loss, total_len)
             print(f"Mean responder error: {per_responder_mae / total_len}")
-            print(f"Mean loss: {(seq_loss / total_len).item()}")
+            print(f"Mean Loss: {(epoch_loss)}, {epoch_loss.sum().item()}")
+
+        return per_responder_mae.detach() / total_len, epoch_loss.detach()
 
     def run(self) -> None:
         """Running training and eval."""
         save_path = Path(f"ckpt/{time.time()}")
         save_path.mkdir(parents=True, exist_ok=False)
 
+        torch.save(
+            {
+                "train_seq_len": self.train_seq_len,
+                "train_time_window": self.train_dataloader.dataset.time_context_length,
+                "val_time_window": self.train_dataloader.dataset.time_context_length,
+                "train_dataloader_len": len(self.train_dataloader),
+                "val_dataloader_len": len(self.val_dataloader),
+                "lr": self.optimizer.param_groups[0]["lr"],
+            },
+            f=(save_path / "meta.pt").as_posix(),
+        )
+
         for i in range(self.num_epochs):
+
             print(f"Training epoch {i}...")
             self.model.train()
-            self.run_epoch(dataloader=self.train_dataloader)
+            train_mean_responder_error, train_mean_loss_vector = self.run_epoch(
+                dataloader=self.train_dataloader
+            )
 
-            # with torch.no_grad():
-            # print(f"Validating epoch {i}")
-            # self.model.eval()
+            with torch.no_grad():
+                print(f"Validating epoch {i}")
+                self.model.reset_memory()
+                self.model.eval()
 
-            # Create the full memory context of the training set
-            # self.run_epoch(dataloader=self.train_dataloader)
+                # Validate on the held-out data.
+                val_mean_responder_error, val_mean_loss_vector = self.run_epoch(
+                    dataloader=self.val_dataloader
+                )
 
-            # Validate on the held-out data.
-            # self.run_epoch(dataloader=self.val_dataloader)
-
-            # torch.save(
-            #     {
-            #         "epoch": i,
-            #         "state_dict": self.model.state_dict(),
-            #         "optimizer": self.optimizer.state_dict(),
-            #     },
-            #     f=(save_path / f"{i}.pt").as_posix(),
-            # )
+                torch.save(
+                    {
+                        "epoch": i,
+                        "state_dict": self.model.state_dict(),
+                        "optimizer": self.optimizer.state_dict(),
+                        "training": {
+                            "mean_responder_error": train_mean_responder_error.detach().cpu(),
+                            "mean_loss_vector": train_mean_loss_vector.detach().cpu(),
+                        },
+                        "validation": {
+                            "mean_responder_error": val_mean_responder_error.detach().cpu(),
+                            "mean_loss_vector": val_mean_loss_vector.detach().cpu(),
+                        },
+                        "lr": self.optimizer.param_groups[0]["lr"],
+                    },
+                    f=(save_path / f"{i}.pt").as_posix(),
+                )
 
     @staticmethod
     def create_dataloader(parquet_files: List[str], window_size: int, **kwargs) -> DataLoader:
@@ -279,16 +332,16 @@ class ModelRunner:
     def create_model() -> torch.nn.Module:
         """Create the model on GPU."""
         return TransformerModel(
-            n_blocks=1,
+            n_blocks=4,
             n_feature_len=79,
             n_responder_len=9,
             n_query=4,
-            n_head=1,
-            d_model=256,
+            n_head=2,
+            d_model=512,
         ).cuda()
 
     @staticmethod
-    def create_optimizer(model: torch.nn.Module, lr: float = 0.001) -> torch.optim.Optimizer:
+    def create_optimizer(model: torch.nn.Module, lr: float = 0.00025) -> torch.optim.Optimizer:
         """Create the optimizer"""
         return torch.optim.AdamW(
             params=model.parameters(),
@@ -349,7 +402,7 @@ class ModelRunner:
         """Run pytorch CPU and GPU profiler on the model and print to console."""
         from torch.profiler import profile, ProfilerActivity
 
-        inputs = self.make_dummy_input(seq_len=1000)
+        inputs = self.make_dummy_input(seq_len=100)
         dict_to_cuda(sample=inputs)
 
         print("Running profiler...")
