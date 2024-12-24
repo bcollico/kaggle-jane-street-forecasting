@@ -64,6 +64,7 @@ def dict_to_cuda(sample: Dict[Any, torch.Tensor]) -> None:
     for k, v in sample.items():
         sample[k] = v.cuda()
 
+
 class ModelRunner:
     """Model running class for training."""
 
@@ -108,7 +109,7 @@ class ModelRunner:
         self.model = self.create_model()
         print(f"Created model with {self.get_num_params()} parameters")
 
-        dummy_inputs: Dict[str, torch.Tensor] = self.make_dummy_input()
+        dummy_inputs: Dict[str, torch.Tensor] = self.make_dummy_input(seq_len=100)
         summary(
             self.model,
             input_data=list(dummy_inputs.values()),
@@ -118,9 +119,9 @@ class ModelRunner:
         self.lr_scheduler = torch.optim.lr_scheduler.CyclicLR(
             optimizer=self.optimizer,
             base_lr=self.optimizer.param_groups[0]["lr"],
-            max_lr=self.optimizer.param_groups[0]["lr"] * 10.0,
-            step_size_up=len(self.train_dataloader) / 2.6,
-            step_size_down=len(self.train_dataloader) / 2.6,
+            max_lr=self.optimizer.param_groups[0]["lr"] * 5.0,
+            step_size_up=int(len(self.train_dataloader) * 1.6),
+            step_size_down=int(len(self.train_dataloader) * 1.6),
         )
 
         self.loss = torch.nn.SmoothL1Loss(reduction="none")
@@ -226,7 +227,7 @@ class ModelRunner:
             print(f"Mean responder error: {per_responder_mae / total_len}")
             print(f"Mean Loss: {(epoch_loss)}, {epoch_loss.sum().item()}")
 
-        return per_responder_mae.detach() / total_len, epoch_loss.detach()
+        return per_responder_mae.detach().cpu() / total_len, epoch_loss.detach().cpu()
 
     def run(self) -> None:
         """Running training and eval."""
@@ -293,12 +294,12 @@ class ModelRunner:
     def create_model() -> torch.nn.Module:
         """Create the model on GPU."""
         return TransformerModel(
-            n_blocks=4,
+            n_blocks=8,
             n_feature_len=79,
             n_responder_len=9,
             n_query=4,
-            n_head=2,
-            d_model=512,
+            n_head=4,
+            d_model=1024,
         ).cuda()
 
     @staticmethod
