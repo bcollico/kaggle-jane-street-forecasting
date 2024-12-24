@@ -127,53 +127,29 @@ class TransformerModel(torch.nn.Module):
         self.n_responder_len = n_responder_len
 
         # Embeddings are just linear layers since the inputs are real-valued.
-        self.feature_embedding = torch.nn.Linear(in_features=n_feature_len, out_features=d_model)
+        self.feature_embedding = torch.nn.Linear(
+            in_features=n_feature_len, out_features=d_model, bias=False
+        )
         self.responder_embedding = torch.nn.Linear(
-            in_features=n_responder_len, out_features=d_model
+            in_features=n_responder_len, out_features=d_model, bias=False
         )
 
         # Create embeddings for all possible uint8 symbols, most of these will not be updated, but
         # to make the model extensible to new symbols let's allocate enough for any 8-bit int ID.
         # Start embeddings at zero so that unseen embeddings have no contribution to the features.
-        self.symbol_embedding_f = torch.nn.Embedding.from_pretrained(
-            torch.normal(mean=0.0, std=0.1, size=(256, d_model)),
-            freeze=False,
-            scale_grad_by_freq=True,
-        )
+        self.symbol_embedding_f = self.create_embedding(256, d_model)
+        self.symbol_embedding_r = self.create_embedding(256, d_model)
 
         # Date embedding. Assume that Date IDs are consistent such that when we take modulus with
         # 365 we get the same day of the year (potentially not correct due to leap year).
-        self.date_embedding_f = torch.nn.Embedding.from_pretrained(
-            torch.normal(mean=0.0, std=0.1, size=(365, d_model)),
-            freeze=False,
-            scale_grad_by_freq=True,
-        )
+        self.date_embedding_f = self.create_embedding(365, d_model)
+        self.date_embedding_r = self.create_embedding(365, d_model)
 
         # Absolute time embedding. The training dataset has <1000 absolute time indices. It's
         # uncertain how I should be using these since the actual time between time_ids is not fixed,
         # but we should use some form of absolute time embedding to capture intra-day trends.
-        self.time_embedding_f = torch.nn.Embedding.from_pretrained(
-            torch.normal(mean=0.0, std=0.1, size=(1000, d_model)),
-            freeze=False,
-            scale_grad_by_freq=True,
-        )
-
-        # Create separate embedding layers for the responders.
-        self.symbol_embedding_r = torch.nn.Embedding.from_pretrained(
-            torch.normal(mean=0.0, std=0.1, size=(256, d_model)),
-            freeze=False,
-            scale_grad_by_freq=True,
-        )
-        self.date_embedding_r = torch.nn.Embedding.from_pretrained(
-            torch.normal(mean=0.0, std=0.1, size=(365, d_model)),
-            freeze=False,
-            scale_grad_by_freq=True,
-        )
-        self.time_embedding_r = torch.nn.Embedding.from_pretrained(
-            torch.normal(mean=0.0, std=0.1, size=(1000, d_model)),
-            freeze=False,
-            scale_grad_by_freq=True,
-        )
+        self.time_embedding_f = self.create_embedding(1000, d_model)
+        self.time_embedding_r = self.create_embedding(1000, d_model)
 
         # Positional encoding var.
         self.rope = RotaryPositionalEncoding(d_model=d_model, enable_sin_cos_caching=True)
@@ -213,6 +189,15 @@ class TransformerModel(torch.nn.Module):
             ]
         )
 
+    @staticmethod
+    def create_embedding(dim_in: int, dim_out: int) -> torch.nn.Embedding:
+        """Create an embedding layer initialized with weights sampled from N(0, 0.1)."""
+        return torch.nn.Embedding.from_pretrained(
+            torch.normal(mean=0.0, std=0.1, size=(dim_in, dim_out)),
+            freeze=False,
+            scale_grad_by_freq=False,
+        )
+
     def reset_memory(self) -> None:
         """Reset the memory matrices for each transformer block layer."""
         self.cross_attn_layer.attention.reset_memory()
@@ -245,7 +230,7 @@ class TransformerModel(torch.nn.Module):
         Returns:
             causal_mask (torch.Tensor): Bool tensor id_mat_1.T < id_mat_2, (1, seq_len_1, seq_len_2)
         """
-        return (id_mat_1.transpose(-1, -2) < id_mat_2).unsqueeze(0)
+        return id_mat_1.unsqueeze(1).transpose(-1, -2) < id_mat_2.unsqueeze(1)
 
     def forward(
         self,
