@@ -15,15 +15,15 @@ class SwiGLUFeedForward(torch.nn.Module):
     def __init__(self, n_feat: int, n_feat_exp: int, swish_beta: float = 1.0) -> None:
         super().__init__()
 
-        self.linear1 = torch.nn.Linear(in_features=n_feat, out_features=n_feat_exp)
-        self.swiglu_gate = torch.nn.Linear(in_features=n_feat, out_features=n_feat_exp)
-        self.linear2 = torch.nn.Linear(in_features=n_feat_exp, out_features=n_feat)
+        self.linear1 = torch.nn.Linear(in_features=n_feat, out_features=n_feat_exp, bias=False)
+        self.swiglu_gate = torch.nn.Linear(in_features=n_feat, out_features=n_feat_exp, bias=False)
+        self.linear2 = torch.nn.Linear(in_features=n_feat_exp, out_features=n_feat, bias=False)
 
         self.swish = lambda x, b: x * torch.nn.functional.sigmoid(b * x)
-        self.swish_beta = torch.tensor(swish_beta)
+        self.swish_beta = torch.nn.Parameter(data=torch.tensor(swish_beta))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """SwiGLU feed-forward: (swish(xW+b) * (xV+c))U + d
+        """SwiGLU feed-forward: (swish(xW+b, beta) * (xV+c))U + d
 
         Args:
             x (torch.Tensor): Input tensor (..., n_feat)
@@ -213,7 +213,7 @@ class GroupedQueryAttention(torch.nn.Module):
         self.query_proj = torch.nn.Linear(in_features=d_model, out_features=d_model, bias=False)
 
         # (d_model, d_model) projection matrix
-        self.attn_proj = torch.nn.Linear(in_features=d_model, out_features=d_model)
+        self.attn_proj = torch.nn.Linear(in_features=d_model, out_features=d_model, bias=False)
 
         # Scaled attention uses the feature length for each query.
         self.attention_scale = 1.0 / torch.sqrt(torch.tensor(self.d_head))
@@ -394,7 +394,7 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
             d_model=d_model, n_query=n_query, n_head=n_head, dropout_pct=dropout_pct, rope=rope
         )
 
-        self.mem_activation = torch.nn.ELU()
+        self.mem_activation = lambda x: torch.nn.functional.elu(x) + 1.0
 
         # Memory parameters. Keep a feature-length memory matrix and normalization vector for each
         # head.
@@ -412,7 +412,8 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
         # Scalar parameter for mixing the attention scores from the current forward pass with the
         # memory context.
         self.memory_weight = torch.nn.Parameter(
-            data=torch.ones(self.n_head * self.n_query), requires_grad=True
+            data=torch.normal(mean=0.0, std=0.1, size=(self.n_head * self.n_query,)),
+            requires_grad=True,
         )
 
     def calculate_memory_attention(
