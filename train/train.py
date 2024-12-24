@@ -64,44 +64,6 @@ def dict_to_cuda(sample: Dict[Any, torch.Tensor]) -> None:
     for k, v in sample.items():
         sample[k] = v.cuda()
 
-
-# def pad_and_unsqueeze(tensor: torch.Tensor, desired_len: int) -> torch.Tensor:
-#     """Pad and unsqueeze 1D and 2D tensors to prepare for concat along batch dimension."""
-#     # Set the padding shape
-#     pad_len = desired_len - tensor.shape[0]
-#     pad = (0, 0, pad_len, 0) if len(tensor.shape) == 2 else (pad_len, 0)
-
-#     # Pad the 1D tensors (integer values) with -1, pad the 2D tensors (features/responders) to 0.0
-#     value = -1 if len(tensor.shape) == 1 else 0
-
-#     return torch.nn.functional.pad(tensor, pad=pad, mode="constant", value=value).unsqueeze(0)
-
-
-# def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-#     """Collate the dictionary batches by padding each tensor and concatenating on new batch
-#     dimension."""
-#     max_len: int = 0
-#     for item in batch:
-#         max_len = max(item["date_id"].numel(), max_len)
-
-#     # Prepare the first sample to be the base for the rest of the batch.
-#     base = batch[0]
-#     for k, v in base.items():
-#         base[k] = pad_and_unsqueeze(tensor=v, desired_len=max_len)
-
-#     for sample in batch[1:]:
-#         for k, v in sample.items():
-#             # Concat the new tensor into the base for this batch.
-#             base[k] = torch.concat(
-#                 (base[k], pad_and_unsqueeze(tensor=sample[k], desired_len=max_len))
-#             )
-
-#             # Free the memory for this sample.
-#             sample[k] = None
-
-#     return base
-
-
 class ModelRunner:
     """Model running class for training."""
 
@@ -125,7 +87,6 @@ class ModelRunner:
             window_size=32,
             batch_size=1,
             shuffle=False,
-            # collate_fn=collate_fn,
         )
 
         self.log_dataloader_info(self.train_dataloader, mode="train")
