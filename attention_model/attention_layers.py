@@ -398,11 +398,13 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
 
         # Memory parameters. Keep a feature-length memory matrix and normalization vector for each
         # head.
+        self.memory: torch.Tensor
         self.register_buffer(
             name="memory",
             tensor=torch.zeros((self.d_head * n_head, self.d_head * n_head)),
             persistent=True,
         )
+        self.memory_norm: torch.Tensor
         self.register_buffer(
             name="memory_norm",
             tensor=torch.ones((self.d_head * n_head, 1)),
@@ -471,11 +473,10 @@ class InfiniGroupedQueryAttention(GroupedQueryAttention):
         self.memory_norm += torch.sum(sigma_k, dim=(0, 1)).unsqueeze(-1)
 
     def reset_memory(self) -> None:
-        self.memory.zero_()
-        self.memory_norm.fill_(1.0)
-
-        self.memory = self.memory.detach()
-        self.memory_norm = self.memory_norm.detach()
+        """Reset the built-in memory and memory_norm buffers and detach from the current
+        computational graph."""
+        self.memory.zero_().detach_()
+        self.memory_norm.fill_(1.0).detach_()
 
     def calculate_recurrent_attention(
         self, attention_out: torch.Tensor, attention_memory: torch.Tensor
