@@ -197,7 +197,9 @@ class DatetimeParquetDataset(ParquetDataset):
     multiple symbols). The samples will also include features+lags for the time_context_window
     previous date+time samples."""
 
-    def __init__(self, file_paths: List[str], time_context_length: int = 1, logging=True):
+    def __init__(
+        self, file_paths: List[str], time_context_length: int = 1, logging=True, preload_all=False
+    ):
         super().__init__(file_paths=file_paths, logging=logging)
 
         self.time_context_length = time_context_length
@@ -211,6 +213,39 @@ class DatetimeParquetDataset(ParquetDataset):
         # Iterate through all the partial DateTimeSegments and finish populating
         # them with offsets and segment indices.
         self._finalize_dt_segments()
+
+        self.preloaded_df_groups: Optional[List[torch.Tensor]] = None
+        if preload_all:
+            print("Preloading all row group dataframes.")
+            print(
+                "WARNING: This loads the full dataset into memory. Use `preload_all=False` "
+                "with `Dataloader(..., num_workers=0)` to enable memory-efficient, "
+                "single-threaded data loading."
+            )
+
+            self.preloaded_df_groups = []
+            group: RowGroupOffset
+            for group in self.cum_total_counts:
+                self._load_pq_file(
+                    file_idx=group.file_idx,
+                    row_group_idx=group.row_group_idx,
+                )
+
+                # Preload the dataframe as a torch tensor to avoid bottleneck in each dataloader
+                # worker. Trying to
+                self.preloaded_df_groups.append(
+                    torch.from_numpy(self.pq_cache.df.to_numpy()).float()
+                )
+
+            if logging:
+                print(f"Loaded {len(self.preloaded_df_groups)} row groups.")
+        else:
+            print(
+                "WARNING: Using `num_workers > 0` with `preload_all=False` can cause the "
+                "dataloader to hang due to many simultaneous Polars DataFrame operations. "
+                "Use single-threaded dataloading by setting `num_workers=0` if passing "
+                "`preload_all=False`."
+            )
 
     def _populate_partial_dt_segments(self) -> None:
         """Iterate the parquet files in the dataset and partially populate the DateTimeSegments
@@ -296,7 +331,6 @@ class DatetimeParquetDataset(ParquetDataset):
         """
 
         idx = idx * self.time_context_length + self.time_context_length
-
         rows, row_offsets = self._get_dt_sample_range(
             start_idx=max(0, idx - self.time_context_length),
             end_idx=min(len(self.date_time_segments) - 1, idx),
@@ -343,10 +377,6 @@ class DatetimeParquetDataset(ParquetDataset):
 
             # Get the RowGroupOffset metadata for this row group and load it from the parquet file.
             group: RowGroupOffset = self.cum_total_counts[row_group_idx]
-            self._load_pq_file(
-                file_idx=group.file_idx,
-                row_group_idx=group.row_group_idx,
-            )
 
             # start offset within this group is the total start offset minus the group start offset.
             # If it's greater than zero, we need to discard some rows from the start of this row
@@ -367,14 +397,22 @@ class DatetimeParquetDataset(ParquetDataset):
                 else end_segment.end_offset - group.offset
             )
 
-            # The start row offset is ahead of the starting point for this row group.
-            # Need to select the rows starting at the offset.
-            row_df = self.pq_cache.df[start_offset:end_offset]
+            if self.preloaded_df_groups is not None:
+                df_list.append(self.preloaded_df_groups[row_group_idx][start_offset:end_offset])
+            else:
+                self._load_pq_file(
+                    file_idx=group.file_idx,
+                    row_group_idx=group.row_group_idx,
+                )
 
-            # Interestingly, it's 1.5-2x faster to do `to_numpy` and then `torch.from_numpy` than
-            # `to_torch` using polars. It's also faster to use `torch.Tensor.float()` than the
-            # `dtype` keyword in polars.
-            df_list.append(torch.from_numpy(row_df.to_numpy()).float())
+                # The start row offset is ahead of the starting point for this row group.
+                # Need to select the rows starting at the offset.
+                row_df = self.pq_cache.df[start_offset:end_offset]
+
+                # Interestingly, it's 1.5-2x faster to do `to_numpy` and then `torch.from_numpy` than
+                # `to_torch` using polars. It's also faster to use `torch.Tensor.float()` than the
+                # `dtype` keyword in polars.
+                df_list.append(torch.from_numpy(row_df.to_numpy()).float())
 
         # Get the number of rows per date/time and return the cumulative counts for indexing into
         # the output tensors.

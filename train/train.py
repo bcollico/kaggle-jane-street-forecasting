@@ -14,7 +14,6 @@ sys.path.insert(0, parentdir)
 
 import torch
 from torch.utils.data import DataLoader
-from torchsummary import summary
 
 from attention_model.attention_model import TransformerModel
 from parquet_dataset.parquet_dataset import DatetimeParquetDataset
@@ -27,7 +26,7 @@ random.seed(0)
 np.random.seed(0)
 torch.manual_seed(0)
 
-K_TRAIN_INDICES = [8]  # 0, 1, 2, 3, 4, 5, 6, 7,
+K_TRAIN_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8]
 K_VAL_INDICES = [9]
 
 # fmt: off
@@ -68,7 +67,7 @@ def dict_to_cuda(sample: Dict[Any, torch.Tensor]) -> None:
 class ModelRunner:
     """Model running class for training."""
 
-    def __init__(self, num_epochs: int = 100, train_seq_len: int = 32) -> None:
+    def __init__(self, num_epochs: int = 100, train_seq_len: int = 64) -> None:
 
         self.num_epochs = num_epochs
         self.train_seq_len = train_seq_len
@@ -85,9 +84,13 @@ class ModelRunner:
 
         self.train_dataloader: DataLoader = self.create_dataloader(
             parquet_files=[make_parquet_path(i) for i in K_TRAIN_INDICES],
-            window_size=32,
+            window_size=128,
             batch_size=1,
             shuffle=False,
+            preload_all=True,
+            num_workers=8,
+            persistent_workers=True,
+            prefetch_factor=8,
         )
 
         self.log_dataloader_info(self.train_dataloader, mode="train")
@@ -99,21 +102,19 @@ class ModelRunner:
         # from there.
         self.val_dataloader = self.create_dataloader(
             parquet_files=[make_parquet_path(i) for i in K_VAL_INDICES],
-            window_size=32,
+            window_size=128,
             batch_size=1,
             shuffle=False,
+            preload_all=True,
+            num_workers=8,
+            persistent_workers=True,
+            prefetch_factor=8,
         )
 
         self.log_dataloader_info(self.val_dataloader, mode="val")
 
         self.model = self.create_model()
         print(f"Created model with {self.get_num_params()} parameters")
-
-        dummy_inputs: Dict[str, torch.Tensor] = self.make_dummy_input(seq_len=100)
-        summary(
-            self.model,
-            input_data=list(dummy_inputs.values()),
-        )
 
         self.optimizer = self.create_optimizer(self.model)
         self.lr_scheduler = torch.optim.lr_scheduler.CyclicLR(
@@ -142,7 +143,7 @@ class ModelRunner:
             }
         )
 
-    def run_epoch(self, dataloader: DataLoader) -> None:
+    def run_epoch(self, dataloader: DataLoader, train_seq_len: int) -> None:
         """Run the model through the dataloader one full time."""
 
         # Reset the memory before running an epoch.
@@ -195,8 +196,7 @@ class ModelRunner:
             # Sum to (n_responder_len,) shape and add to running total
             per_responder_mae += (targets - predictions).abs().sum(dim=(0, 1)).cpu().detach()
 
-            if self.model.training and (i + 1) % self.train_seq_len == 0:
-                print("backwards...")
+            if self.model.training and (i + 1) % train_seq_len == 0:
                 # Divide the total responder vector by the total number of predicted elements
                 # to get the mean responder vector for this sequence.
                 seq_loss = torch.div(seq_loss, num_rows_per_sequence)
@@ -251,7 +251,7 @@ class ModelRunner:
             print(f"Training epoch {i}...")
             self.model.train()
             train_mean_responder_error, train_mean_loss_vector = self.run_epoch(
-                dataloader=self.train_dataloader
+                dataloader=self.train_dataloader, train_seq_len=self.train_seq_len
             )
 
             with torch.no_grad():
@@ -261,7 +261,7 @@ class ModelRunner:
 
                 # Validate on the held-out data.
                 val_mean_responder_error, val_mean_loss_vector = self.run_epoch(
-                    dataloader=self.val_dataloader
+                    dataloader=self.val_dataloader, train_seq_len=self.train_seq_len
                 )
 
                 torch.save(
@@ -283,10 +283,15 @@ class ModelRunner:
                 )
 
     @staticmethod
-    def create_dataloader(parquet_files: List[str], window_size: int, **kwargs) -> DataLoader:
+    def create_dataloader(
+        parquet_files: List[str], window_size: int, preload_all: bool = False, **kwargs
+    ) -> DataLoader:
         """Create the parquet dataloader. Pass DataLoader options as kwargs."""
         dataset = DatetimeParquetDataset(
-            file_paths=parquet_files, time_context_length=window_size, logging=False
+            file_paths=parquet_files,
+            time_context_length=window_size,
+            logging=True,
+            preload_all=preload_all,
         )
         return DataLoader(dataset=dataset, **kwargs)
 
@@ -294,7 +299,7 @@ class ModelRunner:
     def create_model() -> torch.nn.Module:
         """Create the model on GPU."""
         return TransformerModel(
-            n_blocks=8,
+            n_blocks=4,
             n_feature_len=79,
             n_responder_len=9,
             n_query=4,
