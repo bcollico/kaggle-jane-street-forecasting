@@ -378,6 +378,15 @@ class DatetimeParquetDataset(ParquetDataset):
             # Get the RowGroupOffset metadata for this row group and load it from the parquet file.
             group: RowGroupOffset = self.cum_total_counts[row_group_idx]
 
+            if self.preloaded_df_groups is not None:
+                df = self.preloaded_df_groups[row_group_idx]
+            else:
+                self._load_pq_file(
+                    file_idx=group.file_idx,
+                    row_group_idx=group.row_group_idx,
+                )
+                df = self.pq_cache.df
+
             # start offset within this group is the total start offset minus the group start offset.
             # If it's greater than zero, we need to discard some rows from the start of this row
             # group.
@@ -392,18 +401,14 @@ class DatetimeParquetDataset(ParquetDataset):
             # take the whole group. Otherwise we'll discard some rows from the end of this row
             # group.
             end_offset = (
-                len(self.pq_cache.df)
+                len(df)
                 if row_group_idx != end_row_group_idx
                 else end_segment.end_offset - group.offset
             )
 
             if self.preloaded_df_groups is not None:
-                df_list.append(self.preloaded_df_groups[row_group_idx][start_offset:end_offset])
+                df_list.append(df[start_offset:end_offset])
             else:
-                self._load_pq_file(
-                    file_idx=group.file_idx,
-                    row_group_idx=group.row_group_idx,
-                )
 
                 # The start row offset is ahead of the starting point for this row group.
                 # Need to select the rows starting at the offset.
