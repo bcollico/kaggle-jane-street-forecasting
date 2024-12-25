@@ -26,7 +26,7 @@ random.seed(0)
 np.random.seed(0)
 torch.manual_seed(0)
 
-K_TRAIN_INDICES = [7, 8]
+K_TRAIN_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8]
 K_VAL_INDICES = [9]
 
 # fmt: off
@@ -67,7 +67,7 @@ def dict_to_cuda(sample: Dict[Any, torch.Tensor]) -> None:
 class ModelRunner:
     """Model running class for training."""
 
-    def __init__(self, num_epochs: int = 100, train_seq_len: int = 64) -> None:
+    def __init__(self, num_epochs: int = 100, train_seq_len: int = 128) -> None:
 
         self.num_epochs = num_epochs
         self.train_seq_len = train_seq_len
@@ -75,7 +75,7 @@ class ModelRunner:
         # Tensor for weighting the elements of the responder loss.
         # Normalized to sum to 1.0.
         self.loss_responder_weighting = torch.tensor(
-            [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+            [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 5.0, 1.0, 1.0]
         ).cuda()
         self.loss_responder_weighting = torch.div(
             self.loss_responder_weighting, self.loss_responder_weighting.sum()
@@ -84,10 +84,10 @@ class ModelRunner:
 
         self.train_dataloader: DataLoader = self.create_dataloader(
             parquet_files=[make_parquet_path(i) for i in K_TRAIN_INDICES],
-            window_size=128,
+            window_size=64,
             batch_size=1,
             shuffle=False,
-            # preload_all=True,
+            preload_all=True,
             # num_workers=8,
             # persistent_workers=True,
             # prefetch_factor=8,
@@ -102,11 +102,11 @@ class ModelRunner:
         # from there.
         self.val_dataloader = self.create_dataloader(
             parquet_files=[make_parquet_path(i) for i in K_VAL_INDICES],
-            window_size=128,
+            window_size=64,
             batch_size=1,
             shuffle=False,
-            # preload_all=True,
-            # num_workers=8,
+            preload_all=True,
+            # num_workers=8, # It's actually slower to use multiple dataloader workers by a factor of 2 LOL
             # persistent_workers=True,
             # prefetch_factor=8,
         )
@@ -114,15 +114,17 @@ class ModelRunner:
         self.log_dataloader_info(self.val_dataloader, mode="val")
 
         self.model = self.create_model()
+
         print(f"Created model with {self.get_num_params()} parameters")
 
         self.optimizer = self.create_optimizer(self.model)
+
         self.lr_scheduler = torch.optim.lr_scheduler.CyclicLR(
             optimizer=self.optimizer,
             base_lr=self.optimizer.param_groups[0]["lr"],
             max_lr=self.optimizer.param_groups[0]["lr"] * 5.0,
-            step_size_up=int(len(self.train_dataloader) * 1.6),
-            step_size_down=int(len(self.train_dataloader) * 1.6),
+            step_size_up=int(len(self.train_dataloader) * 1.6 / self.train_seq_len),
+            step_size_down=int(len(self.train_dataloader) * 1.6 / self.train_seq_len),
         )
 
         self.loss = torch.nn.SmoothL1Loss(reduction="none")
@@ -196,11 +198,11 @@ class ModelRunner:
             # Sum to (n_responder_len,) shape and add to running total
             per_responder_mae += (targets - predictions).abs().sum(dim=(0, 1)).cpu().detach()
 
-            if self.model.training and (i + 1) % train_seq_len == 0:
+            if self.model.training and ((i + 1) % train_seq_len == 0 or (i + 1) == len(dataloader)):
                 # Divide the total responder vector by the total number of predicted elements
                 # to get the mean responder vector for this sequence.
-                seq_loss = torch.div(seq_loss, num_rows_per_sequence)
                 epoch_loss += seq_loss.detach().cpu()
+                seq_loss = torch.div(seq_loss, num_rows_per_sequence)
                 total_seq_loss = (seq_loss * self.loss_responder_weighting).sum()
                 print(
                     f"Train Loss: {(seq_loss)}, {total_seq_loss.item()}, "
@@ -226,6 +228,8 @@ class ModelRunner:
             epoch_loss = torch.div(seq_loss, total_len)
             print(f"Mean responder error: {per_responder_mae / total_len}")
             print(f"Mean Loss: {(epoch_loss)}, {epoch_loss.sum().item()}")
+        else:
+            epoch_loss = torch.div(epoch_loss, total_len)
 
         return per_responder_mae.detach().cpu() / total_len, epoch_loss.detach().cpu()
 
@@ -242,6 +246,7 @@ class ModelRunner:
                 "train_dataloader_len": len(self.train_dataloader),
                 "val_dataloader_len": len(self.val_dataloader),
                 "lr": self.optimizer.param_groups[0]["lr"],
+                "loss_weighting": self.loss_responder_weighting,
             },
             f=(save_path / "meta.pt").as_posix(),
         )
