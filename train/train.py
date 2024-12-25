@@ -26,7 +26,7 @@ random.seed(0)
 np.random.seed(0)
 torch.manual_seed(0)
 
-K_TRAIN_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+K_TRAIN_INDICES = [7, 8]
 K_VAL_INDICES = [9]
 
 # fmt: off
@@ -87,10 +87,10 @@ class ModelRunner:
             window_size=128,
             batch_size=1,
             shuffle=False,
-            preload_all=True,
-            num_workers=8,
-            persistent_workers=True,
-            prefetch_factor=8,
+            # preload_all=True,
+            # num_workers=8,
+            # persistent_workers=True,
+            # prefetch_factor=8,
         )
 
         self.log_dataloader_info(self.train_dataloader, mode="train")
@@ -105,10 +105,10 @@ class ModelRunner:
             window_size=128,
             batch_size=1,
             shuffle=False,
-            preload_all=True,
-            num_workers=8,
-            persistent_workers=True,
-            prefetch_factor=8,
+            # preload_all=True,
+            # num_workers=8,
+            # persistent_workers=True,
+            # prefetch_factor=8,
         )
 
         self.log_dataloader_info(self.val_dataloader, mode="val")
@@ -302,8 +302,8 @@ class ModelRunner:
             n_blocks=4,
             n_feature_len=79,
             n_responder_len=9,
-            n_query=4,
-            n_head=4,
+            n_query=8,
+            n_head=2,
             d_model=1024,
         ).cuda()
 
