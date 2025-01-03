@@ -5,6 +5,7 @@ from copy import deepcopy
 import torch
 from attention_model.attention_layers import (
     InfiniGroupedQueryAttention,
+    GroupedQueryAttention,
     RotaryPositionalEncoding,
     SwiGLUFeedForward,
 )
@@ -128,10 +129,10 @@ class TransformerModel(torch.nn.Module):
 
         # Embeddings are just linear layers since the inputs are real-valued.
         self.feature_embedding = torch.nn.Linear(
-            in_features=n_feature_len, out_features=d_model, bias=False
+            in_features=n_feature_len, out_features=d_model, bias=True
         )
         self.responder_embedding = torch.nn.Linear(
-            in_features=n_responder_len, out_features=d_model, bias=False
+            in_features=n_responder_len, out_features=d_model, bias=True
         )
 
         # Create embeddings for all possible uint8 symbols, most of these will not be updated, but
@@ -200,10 +201,13 @@ class TransformerModel(torch.nn.Module):
 
     def reset_memory(self) -> None:
         """Reset the memory matrices for each transformer block layer."""
-        self.cross_attn_layer.attention.reset_memory()
+        if isinstance(self.cross_attn_layer.attention, InfiniGroupedQueryAttention):
+            self.cross_attn_layer.attention.reset_memory()
+
         layer: TransformerBlock
         for layer in self.layers:
-            layer.attention.reset_memory()
+            if isinstance(layer.attention, InfiniGroupedQueryAttention):
+                layer.attention.reset_memory()
 
     @staticmethod
     def create_causal_mask(id_mat_1: torch.Tensor, id_mat_2: torch.Tensor) -> torch.Tensor:
