@@ -315,7 +315,7 @@ class DatetimeParquetDataset(ParquetDataset):
 
     def __len__(self) -> int:
         """Return the number of date/time windows in the dataset."""
-        return len(self.date_time_segments) // self.time_context_length
+        return len(self.date_time_segments) // self.time_context_length - 1
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Get a date/time window.
@@ -373,7 +373,9 @@ class DatetimeParquetDataset(ParquetDataset):
         end_row_group_idx = end_segment.end_idx
 
         df_list: List[torch.Tensor] = []
-        for row_group_idx in range(start_row_group_idx, end_row_group_idx + 1):
+        for row_group_idx in range(
+            start_row_group_idx, min(len(self.cum_total_counts), end_row_group_idx + 1)
+        ):
 
             # Get the RowGroupOffset metadata for this row group and load it from the parquet file.
             group: RowGroupOffset = self.cum_total_counts[row_group_idx]
