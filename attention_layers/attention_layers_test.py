@@ -1,7 +1,7 @@
 import unittest
 import torch
 import torch.nn.functional as f
-from attention_model.attention_layers import InfiniGroupedQueryAttention
+from attention_layers.attention_layers import InfiniGroupedQueryAttention
 
 
 class TestGRMHA(unittest.TestCase):

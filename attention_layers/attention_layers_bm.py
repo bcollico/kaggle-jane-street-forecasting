@@ -12,7 +12,7 @@ currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentfram
 parentdir = os.path.dirname(currentdir)
 sys.path.insert(0, parentdir)
 
-from attention_model.attention_layers import (
+from attention_layers.attention_layers import (
     InfiniGroupedQueryAttention,
     RotaryPositionalEncoding,
 )

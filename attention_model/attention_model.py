@@ -3,7 +3,7 @@
 from typing import Optional
 from copy import deepcopy
 import torch
-from attention_model.attention_layers import (
+from attention_layers.attention_layers import (
     InfiniGroupedQueryAttention,
     GroupedQueryAttention,
     RotaryPositionalEncoding,

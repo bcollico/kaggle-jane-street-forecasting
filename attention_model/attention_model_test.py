@@ -2,7 +2,7 @@ import unittest
 import torch
 
 from attention_model.attention_model import TransformerBlock, TransformerModel
-from attention_model.attention_layers import RotaryPositionalEncoding
+from attention_layers.attention_layers import RotaryPositionalEncoding
 
 
 class ModelTestFixture(unittest.TestCase):
