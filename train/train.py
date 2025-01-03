@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, OrderedDict
+from typing import Any, Dict, List, OrderedDict, Tuple
 from collections import OrderedDict
 import tqdm
 from pathlib import Path
@@ -26,7 +26,7 @@ random.seed(0)
 np.random.seed(0)
 torch.manual_seed(0)
 
-K_TRAIN_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+K_TRAIN_INDICES = [9]
 K_VAL_INDICES = [9]
 
 # fmt: off
@@ -67,7 +67,7 @@ def dict_to_cuda(sample: Dict[Any, torch.Tensor]) -> None:
 class ModelRunner:
     """Model running class for training."""
 
-    def __init__(self, num_epochs: int = 100, train_seq_len: int = 128) -> None:
+    def __init__(self, num_epochs: int = 100, train_seq_len: int = 32, window_size: int = 32) -> None:
 
         self.num_epochs = num_epochs
         self.train_seq_len = train_seq_len
@@ -84,10 +84,10 @@ class ModelRunner:
 
         self.train_dataloader: DataLoader = self.create_dataloader(
             parquet_files=[make_parquet_path(i) for i in K_TRAIN_INDICES],
-            window_size=64,
+            window_size=window_size,
             batch_size=1,
             shuffle=False,
-            preload_all=True,
+            # preload_all=True,
             # num_workers=8,
             # persistent_workers=True,
             # prefetch_factor=8,
@@ -102,10 +102,10 @@ class ModelRunner:
         # from there.
         self.val_dataloader = self.create_dataloader(
             parquet_files=[make_parquet_path(i) for i in K_VAL_INDICES],
-            window_size=64,
+            window_size=window_size,
             batch_size=1,
             shuffle=False,
-            preload_all=True,
+            # preload_all=True,
             # num_workers=8, # It's actually slower to use multiple dataloader workers by a factor of 2 LOL
             # persistent_workers=True,
             # prefetch_factor=8,
@@ -113,21 +113,29 @@ class ModelRunner:
 
         self.log_dataloader_info(self.val_dataloader, mode="val")
 
+        # checkpoint = torch.load("ckpt/1734587441.0320776/99.pt")
         self.model = self.create_model()
+        # self.model.load_state_dict(checkpoint["state_dict"])
 
         print(f"Created model with {self.get_num_params()} parameters")
 
         self.optimizer = self.create_optimizer(self.model)
+        # self.optimizer.load_state_dict(checkpoint["optimizer"])
+        # import pdb; pdb.set_trace()
 
-        self.lr_scheduler = torch.optim.lr_scheduler.CyclicLR(
+        # self.lr_scheduler = torch.optim.lr_scheduler.CyclicLR(
+        #     optimizer=self.optimizer,
+        #     base_lr=self.optimizer.param_groups[0]["lr"],
+        #     max_lr=self.optimizer.param_groups[0]["lr"] * 5.0,
+        #     step_size_up=int(len(self.train_dataloader) * 1.6 / self.train_seq_len),
+        #     step_size_down=int(len(self.train_dataloader) * 1.6 / self.train_seq_len),
+        # )
+        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer=self.optimizer,
-            base_lr=self.optimizer.param_groups[0]["lr"],
-            max_lr=self.optimizer.param_groups[0]["lr"] * 5.0,
-            step_size_up=int(len(self.train_dataloader) * 1.6 / self.train_seq_len),
-            step_size_down=int(len(self.train_dataloader) * 1.6 / self.train_seq_len),
+            T_max=len(self.train_dataloader) / self.train_seq_len * self.num_epochs,
         )
 
-        self.loss = torch.nn.SmoothL1Loss(reduction="none")
+        self.loss = torch.nn.L1Loss(reduction="none")
         self.yeo_johnson_lambdas: torch.Tensor = torch.tensor(K_FEATURE_LAMBDAS)
 
     @staticmethod
@@ -145,8 +153,11 @@ class ModelRunner:
             }
         )
 
-    def run_epoch(self, dataloader: DataLoader, train_seq_len: int) -> None:
-        """Run the model through the dataloader one full time."""
+    def run_epoch(
+        self, dataloader: DataLoader, train_seq_len: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run the model through the dataloader one full time. Return the MAE and Loss mean
+        vectors."""
 
         # Reset the memory before running an epoch.
         self.model.reset_memory()
@@ -304,16 +315,16 @@ class ModelRunner:
     def create_model() -> torch.nn.Module:
         """Create the model on GPU."""
         return TransformerModel(
-            n_blocks=4,
+            n_blocks=1,
             n_feature_len=79,
             n_responder_len=9,
-            n_query=8,
-            n_head=2,
-            d_model=1024,
+            n_query=4,
+            n_head=1,
+            d_model=256,
         ).cuda()
 
     @staticmethod
-    def create_optimizer(model: torch.nn.Module, lr: float = 0.00025) -> torch.optim.Optimizer:
+    def create_optimizer(model: torch.nn.Module, lr: float = 0.0005) -> torch.optim.Optimizer:
         """Create the optimizer"""
         return torch.optim.AdamW(
             params=model.parameters(),
