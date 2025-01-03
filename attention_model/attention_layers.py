@@ -15,9 +15,9 @@ class SwiGLUFeedForward(torch.nn.Module):
     def __init__(self, n_feat: int, n_feat_exp: int, swish_beta: float = 1.0) -> None:
         super().__init__()
 
-        self.linear1 = torch.nn.Linear(in_features=n_feat, out_features=n_feat_exp, bias=False)
-        self.swiglu_gate = torch.nn.Linear(in_features=n_feat, out_features=n_feat_exp, bias=False)
-        self.linear2 = torch.nn.Linear(in_features=n_feat_exp, out_features=n_feat, bias=False)
+        self.linear1 = torch.nn.Linear(in_features=n_feat, out_features=n_feat_exp, bias=True)
+        self.swiglu_gate = torch.nn.Linear(in_features=n_feat, out_features=n_feat_exp, bias=True)
+        self.linear2 = torch.nn.Linear(in_features=n_feat_exp, out_features=n_feat, bias=True)
 
         self.swish = lambda x, b: x * torch.nn.functional.sigmoid(b * x)
         self.swish_beta = torch.nn.Parameter(data=torch.tensor(swish_beta))
@@ -213,7 +213,7 @@ class GroupedQueryAttention(torch.nn.Module):
         self.query_proj = torch.nn.Linear(in_features=d_model, out_features=d_model, bias=False)
 
         # (d_model, d_model) projection matrix
-        self.attn_proj = torch.nn.Linear(in_features=d_model, out_features=d_model, bias=False)
+        self.attn_proj = torch.nn.Linear(in_features=d_model, out_features=d_model, bias=True)
 
         # Scaled attention uses the feature length for each query.
         self.attention_scale = 1.0 / torch.sqrt(torch.tensor(self.d_head))
